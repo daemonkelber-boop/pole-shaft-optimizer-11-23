@@ -154,9 +154,14 @@ class Baseline:
                 return pole_s[label], 0.0, 0.0, 0.0
             davit, _, jt = label.partition(':')
             if davit not in davits:
-                warnings.warn(f"resolve(): label '{label}' not found in pole joints "
-                              f"or davit table -- defaulting to tip (s=0).")
-                return 0.0, 0.0, 0.0, 0.0
+                # Not a davit -> a joint on the pole itself. PLS-POLE names the
+                # pole tip '<pole label>:t' for any pole label (P, POLE, ...).
+                if jt == 't':
+                    return 0.0, 0.0, 0.0, 0.0
+                raise ValueError(
+                    f"Attachment label '{label}' is not a pole attachment label "
+                    f"in the XML (known: {sorted(pole_s)}) and '{davit}' is not a "
+                    f"davit arm (known: {sorted(davits)}). Cannot locate it on the pole.")
             d = davits[davit]
             s, h, dz, az = resolve(d['attach_label'])
             if h == 0.0 and dz == 0.0:
@@ -173,7 +178,7 @@ class Baseline:
                   if 'vang_connectivity' in p['tables'] else []):
             s, h, dz, az = resolve(r['attach_label'])
             L = g(r, 'length')
-            if r['attach_label'] in pole_s:            # on pole face, radial
+            if r['attach_label'].partition(':')[0] not in davits:   # on pole face, radial
                 attach[r['vang_label']] = AttachPoint(r['vang_label'], s, h + L, dz,
                                                       g(r, 'azimuth'))
             else:                                       # on an arm: hangs down
