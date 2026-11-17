@@ -127,12 +127,30 @@ class Baseline:
                 defl_limit=g(r, 'pole_deflection_limit_or') or 0.0,
             )
 
-        # pole attach labels -> distance from tip
+        # ------------------------------------------------------------------
+        # Joint graph -- built from the connectivity tables, independent of
+        # how joints are named. Every joint is either ON THE POLE (distance
+        # below tip) or defined relative to a parent joint:
+        #   pole      <pole_label>:t (tip), relative attachment labels
+        #   davit     <davit_label>:<joint> from the davit property geometry
+        #   vang      tip_label (and vang_label) -> attach_label + length
+        #   clamp     structure_and_tip_attach is the parent joint itself
+        # Loads are then placed by walking the chain down to the pole.
+        # ------------------------------------------------------------------
         pole_s = {}
         for inst in p['tables'].get('relative_attachment_labels_for', []):
             for r in inst['rows']:
                 pole_s[r['joint_label']] = g(r, 'distance_from_origin_top_joint')
-        pole_s.setdefault('P:t', 0.0)
+        pole_labels = {str(r.get('pole_label') or '').strip()
+                       for r in get_single_table(p, 'steel_pole_connectivity')} - {''}
+        pole_labels |= {lab.partition(':')[0] for lab in pole_s}
+        pole_labels.add('P')                       # legacy default
+        for pl in pole_labels:
+            pole_s.setdefault(f"{pl}:t", 0.0)      # PLS-POLE tip joint
+        for r in get_single_table(p, 'steel_pole_connectivity'):
+            tj = str(r.get('tip_joint') or '').strip()
+            if tj:
+                pole_s.setdefault(tj, 0.0)
 
         # davit property intermediate joints: prop -> {joint: (horz, vert)}
         dprops = {}
@@ -143,49 +161,90 @@ class Baseline:
         dprop_tip_depth = {r['davit_property_label']: g(r, 'tip_diameter_or_depth')
                            for r in get_single_table(p, 'tubular_davit_properties')} \
             if 'tubular_davit_properties' in p['tables'] else {}
-
-        # resolve any joint label to (s_pole, extra_horz, dz, azimuth)
         davits = {r['davit_label']: r for r in
                   get_single_table(p, 'tubular_davit_arm_connectivity')} \
             if 'tubular_davit_arm_connectivity' in p['tables'] else {}
 
-        def resolve(label: str) -> Tuple[float, float, float, float]:
-            if label in pole_s:
-                return pole_s[label], 0.0, 0.0, 0.0
-            davit, _, jt = label.partition(':')
-            if davit not in davits:
-                # Not a davit -> a joint on the pole itself. PLS-POLE names the
-                # pole tip '<pole label>:t' for any pole label (P, POLE, ...).
-                if jt == 't':
-                    return 0.0, 0.0, 0.0, 0.0
-                raise ValueError(
-                    f"Attachment label '{label}' is not a pole attachment label "
-                    f"in the XML (known: {sorted(pole_s)}) and '{davit}' is not a "
-                    f"davit arm (known: {sorted(davits)}). Cannot locate it on the pole.")
-            d = davits[davit]
-            s, h, dz, az = resolve(d['attach_label'])
-            if h == 0.0 and dz == 0.0:
-                az = g(d, 'azimuth')
-            if jt in ('O', ''):
-                return s, h, dz, az
-            dh, dv = dprops[d['davit_property_set']][jt]
-            # PLS davit 'vert_offset' is positive DOWNWARD (verified on 003:
-            # DA1 tip at vert_offset -0.5 sits 0.5 ft ABOVE the arm origin).
-            return s, h + dh, dz - dv, az
-
-        attach = {}
+        # vangs: the joint a load sees is the vang TIP (tip_label); older
+        # files reference the vang label itself -> register both.
+        vangs = {}
         for r in (get_single_table(p, 'vang_connectivity')
                   if 'vang_connectivity' in p['tables'] else []):
-            s, h, dz, az = resolve(r['attach_label'])
-            L = g(r, 'length')
-            if r['attach_label'].partition(':')[0] not in davits:   # on pole face, radial
-                attach[r['vang_label']] = AttachPoint(r['vang_label'], s, h + L, dz,
-                                                      g(r, 'azimuth'))
-            else:                                       # on an arm: hangs down
-                prop_set = davits[r['attach_label'].split(':')[0]]['davit_property_set']
-                depth = (dprop_tip_depth.get(prop_set) or 0.0) / 12.0
-                attach[r['vang_label']] = AttachPoint(r['vang_label'], s, h,
-                                                      dz - L - depth / 2.0, az)
+            for key in (str(r.get('tip_label') or '').strip(),
+                        str(r.get('vang_label') or '').strip()):
+                if key:
+                    vangs.setdefault(key, r)
+        # clamps: zero-length, the attach joint is the load point
+        alias = {}
+        for r in (get_single_table(p, 'clamp_insulator_connectivity')
+                  if 'clamp_insulator_connectivity' in p['tables'] else []):
+            j = str(r.get('structure_and_tip_attach') or '').strip()
+            c = str(r.get('clamp_label') or '').strip()
+            if c and j and c != j:
+                alias.setdefault(c, j)
+
+        def _where(label: str) -> str:
+            hits = sorted({k for k, v in p['tables'].items() if 'load' not in k
+                           and any(label in [str(x).strip() for x in row.values()
+                                             if not isinstance(x, dict)]
+                                   for inst in v for row in inst['rows'])})
+            return ', '.join(hits) or 'no connectivity table'
+
+        _memo: Dict[str, Tuple[float, float, float, float]] = {}
+
+        def resolve(label: str, _stack=()) -> Tuple[float, float, float, float]:
+            """Joint label -> (s below tip, extra horz beyond face, dz, azimuth)."""
+            label = str(label).strip()
+            if label in _memo:
+                return _memo[label]
+            if label in _stack:
+                raise ValueError(f"Circular joint connectivity at '{label}'.")
+            st_ = _stack + (label,)
+            if label in pole_s:
+                out = (pole_s[label], 0.0, 0.0, 0.0)
+            elif label in alias:
+                out = resolve(alias[label], st_)
+            elif label in vangs:
+                r = vangs[label]
+                parent = str(r['attach_label']).strip()
+                s, h, dz, az = resolve(parent, st_)
+                L = g(r, 'length') or 0.0
+                ref = str(r.get('measured_relative_to') or 'Face').strip().lower()
+                if parent.partition(':')[0] in davits:          # on an arm: hangs down
+                    prop_set = davits[parent.partition(':')[0]]['davit_property_set']
+                    depth = (dprop_tip_depth.get(prop_set) or 0.0) / 12.0
+                    out = (s, h, dz - L - depth / 2.0, az)
+                elif ref != 'face':
+                    raise ValueError(
+                        f"Vang '{label}' length is measured relative to '{ref}'; only "
+                        "'Face' is supported. Send this XML so it can be added.")
+                else:                                           # on pole face, radial
+                    out = (s, h + L, dz, g(r, 'azimuth'))
+            else:
+                davit, _, jt = label.partition(':')
+                if davit not in davits:
+                    raise ValueError(
+                        f"Cannot locate joint '{label}' on the pole. It appears in: "
+                        f"{_where(label)}. Supported connectivity: steel pole relative "
+                        "attachment labels, tubular davit arms, vangs, clamp insulators.")
+                d = davits[davit]
+                s, h, dz, az = resolve(d['attach_label'], st_)
+                if h == 0.0 and dz == 0.0:
+                    az = g(d, 'azimuth')
+                if jt in ('O', ''):
+                    out = (s, h, dz, az)
+                else:
+                    dh, dv = dprops[d['davit_property_set']][jt]
+                    # PLS davit 'vert_offset' is positive DOWNWARD (verified on 003:
+                    # DA1 tip at vert_offset -0.5 sits 0.5 ft ABOVE the arm origin).
+                    out = (s, h + dh, dz - dv, az)
+            _memo[label] = out
+            return out
+
+        attach = {}
+        for lab in vangs:                       # keep vang points for display
+            s, h, dz, az = resolve(lab)
+            attach[lab] = AttachPoint(lab, s, h, dz, az)
 
         loads = {}
         for r in get_single_table(p, 'loads_at_insulator_attachments_for_all_load_cases'):
