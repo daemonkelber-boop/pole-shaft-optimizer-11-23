@@ -123,8 +123,10 @@ tmp_path = save_xml(uploaded.getvalue()) if uploaded else None
 
 
 # ── Pole diagram helper ────────────────────────────────────────────────────
-def _draw_pole_diagram(spec, base, SB):
-    """Return a matplotlib figure replicating the PLS-POLE elevation view."""
+def _draw_pole_diagram(spec, base, SB, clamp_names=None):
+    """Return a matplotlib figure replicating the PLS-POLE elevation view.
+    clamp_names: {XML joint label: display name}, e.g. {'P:C1': 'C1'}."""
+    clamp_names = clamp_names or {}
     import numpy as np
     import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
@@ -246,6 +248,10 @@ def _draw_pole_diagram(spec, base, SB):
         xf = face_half(yi)
         arm_len = ap.extra_horz
         if arm_len <= 0:
+            # clamp on the pole face (no arm): mark + label on the left face
+            ax.plot(-xf, yi, 's', color=C_CHAIN, ms=5, zorder=6)
+            ax.text(-xf - 0.6, yi, clamp_names.get(ap.label, ap.label.split(':', 1)[-1]),
+                    fontsize=8, ha='right', va='center', color=C_CHAIN, fontweight='bold')
             continue
         x_wire = -(xf + arm_len)   # arms extend left
         # bracket on pole face
@@ -289,11 +295,12 @@ def _draw_pole_diagram(spec, base, SB):
                     xytext=(chain_x + 0.3, yi),
                     arrowprops=dict(arrowstyle='-', color=C_CHAIN,
                                    lw=0.6, linestyle='dotted'))
-        # gap dimension
+        # gap dimension (skip the zero gap of a tip attachment)
         gap = ap.s_pole - prev_rd
         mid = (yi + prev_y_c) / 2
-        ax.text(chain_x - 1.3, mid, f'{gap:.2f}',
-                fontsize=8, ha='right', va='center', color=C_CHAIN)
+        if gap > 0.01:
+            ax.text(chain_x - 1.3, mid, f'{gap:.2f}',
+                    fontsize=8, ha='right', va='center', color=C_CHAIN)
         prev_y_c = yi
         prev_rd  = ap.s_pole
 
@@ -1916,11 +1923,37 @@ with tab8:
         st.info("Upload a PLS-POLE XML file in the sidebar to begin.")
     else:
         try:
+            from pole_layout import build_layout, location_rows
+            from pole_3d import build_figure
             p8    = load_parsed(tmp_path)
             spec8 = build_spec(p8)
             base8 = load_baseline(tmp_path)
-            fig8  = _draw_pole_diagram(spec8, base8, SB)
-            st.pyplot(fig8, use_container_width=False)
-            plt.close(fig8)
+            L8    = build_layout(spec8, base8, p8)
+
+            m = st.columns(5)
+            m[0].metric("Height", f"{L8.total_length:.2f} ft")
+            m[1].metric("Above GL", f"{L8.agl_height:.2f} ft")
+            m[2].metric("Tubes", f"{len(L8.tubes)}")
+            m[3].metric("Slip joints", f"{len(L8.slip_joints)}")
+            m[4].metric("Base plate" if L8.base_plate else "Embedded", f"Ø{L8.base_plate.diameter:.1f} in" if L8.base_plate else f"{L8.embedment:.2f} ft")
+
+            c2d, c3d = st.columns([1, 1])
+            with c2d:
+                st.markdown("**Elevation with dimensions** (ft; width drawn 1.6× for clarity)")
+                names8 = {a.joint: a.label for a in L8.attachments}
+                fig8 = _draw_pole_diagram(spec8, base8, SB, clamp_names=names8)
+                st.pyplot(fig8, width="stretch")
+                plt.close(fig8)
+            with c3d:
+                st.markdown("**3D model** (true scale; drag to rotate, scroll to zoom)")
+                st.plotly_chart(build_figure(L8, SB), width="stretch",
+                                config={"displaylogo": False})
+                st.caption("Amber = slip joint zone (top of male to bottom of female). "
+                           "Red diamonds = clamps, all drawn on one face. "
+                           "The XML gives clamp heights only, not their side of the pole.")
+
+            st.subheader("Locations on the pole")
+            st.dataframe(pd.DataFrame(location_rows(L8)).round(2), width="stretch",
+                         hide_index=True)
         except Exception as e:
             show_error(e)
