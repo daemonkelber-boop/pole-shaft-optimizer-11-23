@@ -246,6 +246,19 @@ def _draw_pole_diagram(spec, base, SB, clamp_names=None, keepout=None):
             xf = max(face_half(y_lap_t), face_half(y_lap_b)) * 1.25
             ax.add_patch(mpatches.Rectangle((-xf, y_lap_b), 2 * xf, y_lap_t - y_lap_b,
                          fill=False, edgecolor='#D50000', lw=2.0, zorder=7))
+    # clearance zones: band + clearance above / below = no slip joint here
+    for r in keepout:
+        s = r.station
+        if not s.checked or s.zone_bot - s.zone_top < 0.01:
+            continue
+        zt = max(s.zone_top, 0.0); zb = min(s.zone_bot, spec.total_length)
+        y_zt, y_zb = y(zt), y(zb)
+        xz = max(face_half(y_zt), face_half(y_zb)) * 1.45
+        zc = '#D50000' if r.ok is False else '#1565C0'
+        ax.add_patch(mpatches.Rectangle((-xz, y_zb), 2 * xz, y_zt - y_zb, facecolor=zc,
+                     alpha=0.12, edgecolor=zc, lw=0.9, linestyle='--', hatch='///', zorder=1))
+        ax.text(xz + 0.3, (y_zt + y_zb) / 2, f'{s.label} clear zone\n{zt:.2f}–{zb:.2f}',
+                fontsize=6.5, ha='left', va='center', color=zc)
     for r in keepout:
         s = r.station
         if not s.checked and s.source == 'XML':
@@ -441,8 +454,11 @@ def _draw_pole_diagram(spec, base, SB, clamp_names=None, keepout=None):
         mpatches.Patch(facecolor=C_LAP,   label='slip lap'),
         mpatches.Patch(facecolor=C_DOT,   label='wire attachment', linestyle='none'),
     ]
+    if any(r.station.checked for r in keepout):
+        patches.append(mpatches.Patch(facecolor='#1565C0', alpha=0.25, hatch='///',
+                                      label='clear zone (no slip joint)'))
     ax.legend(handles=patches, loc='lower center', bbox_to_anchor=(0.5, -0.04),
-              ncol=4, fontsize=7, framealpha=0.4, edgecolor='none')
+              ncol=len(patches), fontsize=7, framealpha=0.4, edgecolor='none')
 
     plt.tight_layout(pad=0.5)
     return fig
@@ -2161,7 +2177,9 @@ with tab8:
                 st.caption("Amber = slip joint zone (top of male to bottom of female). "
                            "Blue diamonds = elevations, all drawn on one face (the XML gives "
                            "clamp heights only, not their side). Dark plates = brackets/vangs. "
-                           "Red = too close to a slip joint.")
+                           "See-through sleeves = clear zones (bracket/vang band + clearance "
+                           "above and below, where no slip joint may sit): blue = clear, "
+                           "red = a slip joint is inside or too close.")
 
             with st.expander("All locations on the pole"):
                 st.dataframe(pd.DataFrame(location_rows(L8)).round(2), width="stretch",

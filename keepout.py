@@ -46,6 +46,16 @@ class Station:
         return self.from_top + self.half
 
     @property
+    def zone_top(self) -> float:
+        """Top of the no-slip-joint zone (band top minus clearance above)."""
+        return self.band_top - max(self.clr_above, 0.0)
+
+    @property
+    def zone_bot(self) -> float:
+        """Bottom of the no-slip-joint zone (band bottom plus clearance below)."""
+        return self.band_bot + max(self.clr_below, 0.0)
+
+    @property
     def checked(self) -> bool:
         return self.kind != "None" or self.clr_above > 0 or self.clr_below > 0
 

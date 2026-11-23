@@ -100,6 +100,7 @@ def build_figure(L: PoleLayout, T: dict, height_px: int = 900, results=None) -> 
     C_CLAMP = T.get('primary', '#3d98d3')
     C_BAD = T.get('danger', '#ed352c')
     C_BRK = T.get('text_secondary', '#2e4a57')
+    C_ZONE = T.get('info', '#3d98d3')
     C_TEXT = T.get('text', '#041e2b')
     C_PLATE = T.get('text_secondary', '#2e4a57')
 
@@ -122,6 +123,23 @@ def build_figure(L: PoleLayout, T: dict, height_px: int = 900, results=None) -> 
                              s.top_agl, s.bot_agl, C_BAD if s.no in bad_joints else C_LAP,
                              f'Slip joint {s.no}',
                              hover=hv, scale=1.03))
+
+    # clearance zones: see-through sleeve over band + clearance above / below
+    for r in results:
+        s = r.station
+        if not s.checked or s.zone_bot - s.zone_top < 0.01:
+            continue
+        zt = max(s.zone_top, 0.0); zb = min(s.zone_bot, L.total_length)
+        bad = r.ok is False
+        hv = (f'{s.label} clear zone (no slip joint)<br>{zt:.2f}–{zb:.2f} ft from top'
+              f'<br>{L.agl_of(zt):.2f}–{L.agl_of(zb):.2f} ft AGL'
+              f'<br>band {s.height_in:.2f} in + {s.clr_above:.2f} ft above + '
+              f'{s.clr_below:.2f} ft below')
+        data.append(_frustum(_d_at(L, zt), _d_at(L, zb), L.agl_of(zt), L.agl_of(zb),
+                             C_BAD if bad else C_ZONE, f'{s.label} clear zone',
+                             opacity=0.28, hover=hv, scale=1.35))
+        data.append(_edges(_d_at(L, zt) * 1.35, _d_at(L, zb) * 1.35, L.agl_of(zt), L.agl_of(zb),
+                           C_BAD if bad else C_ZONE))
 
     # elevations (clamps from the XML + user rows) on the +x flat
     if results:
