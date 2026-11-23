@@ -123,12 +123,13 @@ tmp_path = save_xml(uploaded.getvalue()) if uploaded else None
 
 
 # ── Pole diagram helper ────────────────────────────────────────────────────
-def _draw_pole_diagram(spec, base, SB, clamp_names=None, keepout=None):
+def _draw_pole_diagram(spec, base, SB, clamp_names=None, keepout=None, arms=None):
     """Return a matplotlib figure replicating the PLS-POLE elevation view.
     clamp_names: {XML joint label: display name}, e.g. {'P:C1': 'C1'}.
     keepout: list of keepout.Result -- bracket/vang bands and clashes."""
     clamp_names = clamp_names or {}
     keepout = keepout or []
+    arms = arms or []
     import numpy as np
     import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
@@ -289,10 +290,35 @@ def _draw_pole_diagram(spec, base, SB, clamp_names=None, keepout=None):
     # ========================================================================
     # 4. ARMS
     # ========================================================================
+    # arms from the XML geometry (brackets + davits), drawn to the left;
+    # horizontal distances are true ft measured out from the drawn face
+    for a in arms:
+        if not a.points:
+            continue
+        xs_, ys_ = [], []
+        for pt in a.points:
+            yi = pt.agl
+            rd_ = gl_rd - yi
+            face_true = spec.diameter_at(max(0.0, min(rd_, spec.total_length))) / 24.0
+            xs_.append(-(face_half(yi) + (pt.h - face_true)))
+            ys_.append(yi)
+        ax.plot(xs_, ys_, color=C_POLE if a.is_bracket else C_ARM,
+                lw=3.0 if a.is_bracket else 1.8, solid_capstyle='butt', zorder=5)
+        if not a.is_bracket:
+            ax.text((xs_[0] + xs_[-1]) / 2, max(ys_) + 0.6, f'{a.attach} arm {a.length:.2f}',
+                    fontsize=7.5, ha='center', va='bottom', color=C_ARM)
+            for v, pt in a.vangs:
+                i_ = a.points.index(pt)
+                ax.plot(xs_[i_], ys_[i_] - 0.3, 'o', color=C_DOT, ms=4, zorder=6)
+                ax.text(xs_[i_], ys_[i_] - 0.9, v, fontsize=6.5, ha='center', va='top', color=C_DOT)
+    arm_roots = {a.attach for a in arms}
+
     for ap in attach_pts:
         yi = y(ap.s_pole)
         xf = face_half(yi)
         arm_len = ap.extra_horz
+        if arms and arm_len > 0:
+            continue                       # drawn from the arm geometry above
         if arm_len <= 0:
             # clamp on the pole face (no arm): mark + label on the left face
             ax.plot(-xf, yi, 's', color=C_CHAIN, ms=5, zorder=6)
@@ -2200,11 +2226,26 @@ with tab8:
             with c2d:
                 st.markdown("**Elevation with dimensions** (ft; width drawn 1.6× for clarity)")
                 names8 = {a.joint: a.label for a in L8.attachments}
-                fig8 = _draw_pole_diagram(spec8, base8, SB, clamp_names=names8, keepout=res8)
+                fig8 = _draw_pole_diagram(spec8, base8, SB, clamp_names=names8, keepout=res8,
+                                          arms=L8.arms)
                 st.pyplot(fig8, width="stretch")
                 plt.close(fig8)
             with c3d:
-                _view3d(L8, res8, fkey)
+                eng = st.radio("3D viewer", ["Smooth (three.js)", "Basic (Plotly)"], horizontal=True,
+                               key="v3_engine",
+                               help="Smooth: runs in your browser, glides with no lag. Basic: the "
+                                    "older Plotly view, in case the smooth one does not load.")
+                if eng.startswith("Smooth"):
+                    from pole_viewer import pole_viewer, scene_from
+                    st.markdown("**3D model** (true scale)")
+                    pole_viewer(scene_from(L8, res8, SB, token=fkey), height=820,
+                                key=f"pv_{fkey}")
+                    st.caption("Amber = slip joint (male top to female bottom). See-through sleeve = "
+                               "clear zone (blue clear, red clash). Blue diamonds = elevations on one "
+                               "face. Arms and brackets from the XML at their real length and taper. "
+                               "Hover any part for details.")
+                else:
+                    _view3d(L8, res8, fkey)
                 st.caption("Amber = slip joint zone (top of male to bottom of female). "
                            "Blue diamonds = elevations, all drawn on one face (the XML gives "
                            "clamp heights only, not their side). Dark plates = brackets/vangs. "

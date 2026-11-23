@@ -52,6 +52,27 @@ class Attachment:
 
 
 @dataclass
+class ArmPoint:
+    label: str              # XML joint label, e.g. 'C2_ARM:T3'
+    h: float                # ft, horizontal distance from the pole axis
+    agl: float              # ft above GL
+    d: float                # in, outside diameter / depth at this point
+
+
+@dataclass
+class Arm:
+    label: str              # davit label, e.g. 'C2_ARM', 'C2_BRKT'
+    prop: str               # davit property, e.g. 'COND_ARM_27'
+    attach: str             # pole attach point name, e.g. 'C2'
+    azimuth: float          # deg, from the XML
+    length: float           # ft, arm length along its own axis (XML rel_dist at End)
+    is_bracket: bool
+    shape: str              # e.g. '8F', '4F'
+    points: list = field(default_factory=list)   # ArmPoint, origin -> tip
+    vangs: list = field(default_factory=list)    # (label, ArmPoint)
+
+
+@dataclass
 class BasePlate:
     diameter: float         # in
     thickness: float        # in
@@ -73,6 +94,7 @@ class PoleLayout:
     slip_joints: list[SlipJoint] = field(default_factory=list)
     flange_joints: list[float] = field(default_factory=list)   # from_top
     attachments: list[Attachment] = field(default_factory=list)
+    arms: list[Arm] = field(default_factory=list)
     base_plate: BasePlate | None = None
 
     def agl_of(self, from_top: float) -> float:
@@ -115,25 +137,106 @@ def build_layout(spec, base=None, parsed=None) -> PoleLayout:
         else:
             out.flange_joints.append(tb['end'])
 
-    # clamp names from the XML (P:C1 -> C1), else strip the 'P:' prefix
-    names = {}
-    if parsed is not None:
-        for inst in parsed.get('tables', {}).get('clamp_insulator_connectivity', []):
-            for r in inst['rows']:
-                j = r.get('structure_and_tip_attach')
-                if j:
-                    names[j] = ('clamp', r.get('clamp_label') or j)
-    if base is not None:
-        for ap in sorted(base.attach.values(), key=lambda a: a.s_pole):
-            kind, nm = names.get(ap.label, (None, None))
-            if kind is None:
-                kind = 'davit' if ap.extra_horz > 0 else 'attach'
-                nm = ap.label.split(':', 1)[-1]
-            if ap.s_pole <= 1e-6 and kind == 'clamp':
-                kind = 'tip'
-            out.attachments.append(Attachment(label=nm, joint=ap.label, kind=kind,
-                                              from_top=ap.s_pole, agl=agl_h - ap.s_pole,
-                                              arm_length=ap.extra_horz))
+    T = parsed.get('tables', {}) if parsed is not None else {}
+
+    def rows(name):
+        return [r for inst in T.get(name, []) for r in inst['rows']]
+
+    # ---- elevations: pole attach points (P:X) from the XML ------------------
+    clamp_at = {r.get('structure_and_tip_attach'): (r.get('clamp_label') or '')
+                for r in rows('clamp_insulator_connectivity')}
+    davit_conn = [{k: (v.get('value') if isinstance(v, dict) else v) for k, v in r.items()}
+                  for r in rows('tubular_davit_arm_connectivity')]
+    davit_at = {d['attach_label']: d for d in davit_conn}
+    rel = rows('relative_attachment_labels_for')
+    pts = []
+    if rel:
+        for r in rel:
+            j = r.get('joint_label')
+            pts.append((j, _val(r, 'distance_from_origin_top_joint', 0.0)))
+        if 'P:t' in clamp_at or 'P:t' in davit_at:
+            pts.insert(0, ('P:t', 0.0))
+    elif base is not None:                       # fallback: load-model attachments
+        pts = [(ap.label, ap.s_pole) for ap in base.attach.values()]
+    seen = set()
+    for j, s_ in sorted(pts, key=lambda x: x[1]):
+        if j in seen:
+            continue
+        seen.add(j)
+        nm = j.split(':', 1)[-1]
+        if j in davit_at:
+            kind = 'arm'
+        elif j in clamp_at:
+            kind = 'tip' if s_ <= 1e-6 else 'clamp'
+            if j == 'P:t' and clamp_at[j]:
+                nm = clamp_at[j]
+        else:
+            kind = 'attach'
+        out.attachments.append(Attachment(label=nm, joint=j, kind=kind, from_top=s_,
+                                          agl=agl_h - s_))
+
+    # ---- arms: brackets + davit arms, exact local geometry ------------------
+    if davit_conn:
+        props = {}
+        for r in rows('tubular_davit_properties'):
+            props[r.get('davit_property_label')] = r
+        geo = {}
+        for inst in T.get('intermediate_joints', []):
+            td = inst.get('titledetail') or ''
+            if '"' in td:
+                geo[td.split('"')[1]] = [(r.get('joint_label'), _val(r, 'horz_offset', 0.0),
+                                          _val(r, 'vert_offset', 0.0)) for r in inst['rows']]
+        dia = {}
+        for r in rows('tubular_davit_arm_steel_properties'):
+            el = r.get('element_label')
+            dia.setdefault(el, []).append((_val(r, 'rel_dist', 0.0), _val(r, 'outer_diam', 0.0),
+                                           r.get('joint_label')))
+        vang = {}
+        for r in rows('vang_connectivity'):
+            vang.setdefault(r.get('attach_label'), []).append(r.get('tip_label') or r.get('vang_label'))
+        s_of = {a.joint: a.from_top for a in out.attachments}
+        placed = {}                                       # joint label -> (h, agl, azimuth)
+
+        def face_h(from_top):
+            return (spec.diameter_at(min(max(from_top, 0.0), spec.total_length)) / 24.0)
+
+        todo = list(davit_conn)
+        for _ in range(len(todo) + 1):                    # arms hang off brackets: resolve in order
+            left = []
+            for d in todo:
+                lab, att, pr = d['davit_label'], d['attach_label'], d['davit_property_set']
+                az = float(d.get('azimuth') or 0.0)
+                if att in s_of:                           # on the pole face
+                    s_ = s_of[att]
+                    h0, z0, root = face_h(s_), agl_h - s_, att.split(':', 1)[-1]
+                elif att in placed:                       # on another davit's joint
+                    h0, z0, az0, root = placed[att]
+                    az = az0 + az                         # assumed relative to the parent
+                else:
+                    left.append(d)
+                    continue
+                prop = props.get(pr, {})
+                drows = sorted(dia.get(lab, []))
+                L_ = drows[-1][0] if drows else 0.0
+                d0 = drows[0][1] if drows else _val(prop, 'base_diameter_or_depth', 0.0)
+                d1 = drows[-1][1] if drows else _val(prop, 'tip_diameter_or_depth', 0.0)
+                pts_ = [ArmPoint(f'{lab}:O', h0, z0, d0)]
+                for jl, ho, vo in geo.get(pr, []):
+                    f = (ho / L_) if L_ else 1.0
+                    # vert_offset is positive DOWN in PLS-POLE
+                    pts_.append(ArmPoint(f'{lab}:{jl}', h0 + ho, z0 - vo, d0 + (d1 - d0) * min(f, 1.0)))
+                for p_ in pts_:
+                    placed[p_.label] = (p_.h, p_.agl, az, root)
+                arm = Arm(label=lab, prop=pr, attach=root, azimuth=az, length=L_,
+                          is_bracket='BRKT' in lab.upper() or 'BRACKET' in lab.upper(),
+                          shape=str(prop.get('steel_shape') or ''), points=pts_)
+                for p_ in pts_:
+                    for v in vang.get(p_.label, []):
+                        arm.vangs.append((v, p_))
+                out.arms.append(arm)
+            todo = left
+            if not todo:
+                break
 
     if parsed is not None:
         rows = [r for inst in parsed.get('tables', {}).get('base_plate_properties', [])
