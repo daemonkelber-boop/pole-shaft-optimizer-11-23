@@ -464,6 +464,39 @@ def _draw_pole_diagram(spec, base, SB, clamp_names=None, keepout=None):
     return fig
 
 
+@st.fragment
+def _view3d(L, res, fkey):
+    """3D pole with stepped focus / zoom / view controls. A fragment, so
+    changing the view re-draws only this chart. Wheel zoom is off (Plotly's
+    wheel step is fixed and too coarse); drag rotates as a turntable."""
+    from pole_3d import build_figure
+    st.markdown("**3D model** (true scale)")
+    opts = [("Full pole", None)]
+    opts += [(f"{a.label} · {a.from_top:.2f} ft from top", a.agl) for a in L.attachments]
+    opts += [(f"Slip joint {j.no} · {j.top_from_top:.2f}–{j.bot_from_top:.2f} ft",
+              (j.top_agl + j.bot_agl) / 2) for j in L.slip_joints]
+    opts += [(f"{r.station.label} clear zone", L.agl_of((r.station.zone_top + r.station.zone_bot) / 2))
+             for r in (res or []) if r.station.checked and r.station.zone_bot - r.station.zone_top > 0.01]
+    opts += [("Base / ground line", 1.0)]
+    c = st.columns([2.2, 1.6, 1.2])
+    lab = c[0].selectbox("Focus on", [o[0] for o in opts], key=f"v3_focus_{fkey}")
+    zoom = c[1].select_slider("Zoom", options=[1, 1.5, 2, 3, 4, 6, 8, 12], value=1,
+                              key=f"v3_zoom_{fkey}",
+                              format_func=lambda v: f"{v:g}×")
+    view = c[2].selectbox("View", ["Iso", "Front", "Side", "Top"], key=f"v3_view_{fkey}")
+    focus = dict(opts)[lab]
+    if focus is not None and zoom == 1:
+        st.caption("Pick a zoom above 1× to close in on the focus point.")
+    st.plotly_chart(build_figure(L, SB, results=res, focus_agl=focus, zoom=float(zoom),
+                                 view=view.lower()),
+                    width="stretch",
+                    config={"displaylogo": False, "scrollZoom": False,
+                            "modeBarButtonsToRemove": ["resetCameraLastSave3d"]})
+    st.caption("Left-drag = rotate (pole stays upright). Right-drag or the pan tool = move. "
+               "Mouse wheel is off: use Focus / Zoom / View. Double-click resets to the "
+               "chosen view.")
+
+
 KO_COLS = ["Item", "from_top", "Bracket / vang", "Height (in)",
            "Clear to joint above (ft)", "Clear to joint below (ft)", "Source"]
 
@@ -2171,9 +2204,7 @@ with tab8:
                 st.pyplot(fig8, width="stretch")
                 plt.close(fig8)
             with c3d:
-                st.markdown("**3D model** (true scale; drag to rotate, scroll to zoom)")
-                st.plotly_chart(build_figure(L8, SB, results=res8), width="stretch",
-                                config={"displaylogo": False})
+                _view3d(L8, res8, fkey)
                 st.caption("Amber = slip joint zone (top of male to bottom of female). "
                            "Blue diamonds = elevations, all drawn on one face (the XML gives "
                            "clamp heights only, not their side). Dark plates = brackets/vangs. "

@@ -90,7 +90,9 @@ def _box(x0, x1, y0, y1, z0, z1, color, hover, opacity=1.0):
                      hovertemplate=hover + '<extra></extra>')
 
 
-def build_figure(L: PoleLayout, T: dict, height_px: int = 900, results=None) -> go.Figure:
+def build_figure(L: PoleLayout, T: dict, height_px: int = 900, results=None,
+                 focus_agl: float | None = None, zoom: float = 1.0,
+                 view: str = 'iso') -> go.Figure:
     """T = Style B tokens (style_b.tokens()). results = keepout.check() output."""
     results = results or []
     bad_joints = set().union(*[r.bad_joints for r in results]) if results else set()
@@ -199,22 +201,32 @@ def build_figure(L: PoleLayout, T: dict, height_px: int = 900, results=None) -> 
                              showlegend=False))
 
     fig = go.Figure(data=data)
-    # true scale: aspect ratio = real extents, largest (height) = 1
+    # true scale: same factor on x, y, z. Zoom = bigger scene box in the
+    # orthographic view; focus = camera centre at that height (AGL).
     zmax = L.agl_height + 2.0
     zlo = zmin - 1.0
     half = g * 1.05
     dz = zmax - zlo
+    k = ZOOM * max(zoom, 1.0)
+    ar = dict(x=k * 2 * half / dz, y=k * 2 * half / dz, z=k)
+    zf = (zlo + zmax) / 2 if focus_agl is None or zoom <= 1.0 else focus_agl
+    cz = (zf - (zlo + zmax) / 2) / dz * ar['z']
+    dirs = {'iso': (0.42, -0.72, 0.1), 'front': (0.0, -0.85, 0.0), 'side': (0.85, 0.0, 0.0),
+            'top': (0.0, -0.05, 0.85)}
+    ex, ey, ez = dirs.get(view, dirs['iso'])
     axis = dict(showbackground=False, showgrid=False, zeroline=False, title='',
                 showticklabels=False, showspikes=False)
     fig.update_layout(
         height=height_px, margin=dict(l=0, r=0, t=0, b=0),
         paper_bgcolor='rgba(0,0,0,0)',
-        scene=dict(aspectmode='manual',
-                   aspectratio=dict(x=ZOOM * 2 * half / dz, y=ZOOM * 2 * half / dz, z=ZOOM),
+        # keep the user's own rotation across reruns until focus / zoom / view change
+        uirevision=f"{focus_agl}-{zoom}-{view}",
+        scene=dict(aspectmode='manual', aspectratio=ar, dragmode='turntable',
                    xaxis=dict(axis, range=[-half, half]),
                    yaxis=dict(axis, range=[-half, half]),
                    zaxis=dict(axis, range=[zlo, zmax]),
-                   camera=dict(eye=dict(x=0.42, y=-0.72, z=0.1), center=dict(x=0, y=0, z=0),
+                   camera=dict(eye=dict(x=ex, y=ey, z=cz + ez), center=dict(x=0, y=0, z=cz),
+                               up=dict(x=0, y=0, z=1),
                                projection=dict(type='orthographic'))),
     )
     return fig
