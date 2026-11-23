@@ -78,12 +78,28 @@ def _d_at(L: PoleLayout, from_top: float) -> float:
     return L.tubes[-1].d_bot
 
 
-def build_figure(L: PoleLayout, T: dict, height_px: int = 900) -> go.Figure:
-    """T = Style B tokens (style_b.tokens())."""
+def _box(x0, x1, y0, y1, z0, z1, color, hover, opacity=1.0):
+    x = [x0, x1, x1, x0, x0, x1, x1, x0]
+    y = [y0, y0, y1, y1, y0, y0, y1, y1]
+    z = [z0, z0, z0, z0, z1, z1, z1, z1]
+    i = [0, 0, 4, 4, 0, 0, 1, 1, 2, 2, 3, 3]
+    j = [1, 2, 5, 6, 1, 5, 2, 6, 3, 7, 0, 4]
+    k = [2, 3, 6, 7, 5, 4, 6, 5, 7, 6, 4, 7]
+    return go.Mesh3d(x=x, y=y, z=z, i=i, j=j, k=k, color=color, opacity=opacity,
+                     flatshading=True, showlegend=False,
+                     hovertemplate=hover + '<extra></extra>')
+
+
+def build_figure(L: PoleLayout, T: dict, height_px: int = 900, results=None) -> go.Figure:
+    """T = Style B tokens (style_b.tokens()). results = keepout.check() output."""
+    results = results or []
+    bad_joints = {r.joint_no for r in results if r.ok is False}
     C_STEEL = '#9aa7ad' if T.get('text', '#000').startswith('#0') else '#7f8d94'
     C_EDGE = T.get('chart_ring', '#073247')
     C_LAP = T.get('warning', '#e08d17')
-    C_CLAMP = T.get('danger', '#ed352c')
+    C_CLAMP = T.get('primary', '#3d98d3')
+    C_BAD = T.get('danger', '#ed352c')
+    C_BRK = T.get('text_secondary', '#2e4a57')
     C_TEXT = T.get('text', '#041e2b')
     C_PLATE = T.get('text_secondary', '#2e4a57')
 
@@ -103,21 +119,42 @@ def build_figure(L: PoleLayout, T: dict, height_px: int = 900) -> go.Figure:
               f'<br>top {s.top_from_top:.2f} ft from top · {s.top_agl:.2f} ft AGL'
               f'<br>bottom {s.bot_from_top:.2f} ft from top · {s.bot_agl:.2f} ft AGL')
         data.append(_frustum(_d_at(L, s.top_from_top), _d_at(L, s.bot_from_top),
-                             s.top_agl, s.bot_agl, C_LAP, f'Slip joint {s.no}',
+                             s.top_agl, s.bot_agl, C_BAD if s.no in bad_joints else C_LAP,
+                             f'Slip joint {s.no}',
                              hover=hv, scale=1.03))
 
-    # clamps / attachments on the +x flat
-    xs, ys, zs, txt, hov = [], [], [], [], []
-    for a in L.attachments:
-        r = _d_at(L, a.from_top) / 24.0
-        xs.append(r * 1.02); ys.append(0.0); zs.append(a.agl)
-        txt.append(f'{a.label}  {a.from_top:.2f} ft')
-        hov.append(f'{a.label} ({a.kind})<br>{a.from_top:.2f} ft from top · {a.agl:.2f} ft AGL')
-    if xs:
+    # elevations (clamps from the XML + user rows) on the +x flat
+    if results:
+        pts = [(r.station.label, r.station.from_top, r.station.kind, r) for r in results]
+    else:
+        pts = [(a.label, a.from_top, a.kind, None) for a in L.attachments]
+    groups = {}
+    for label, ft, kind, r in pts:
+        rr = _d_at(L, min(max(ft, 0.0), L.total_length)) / 24.0
+        bad = r is not None and r.ok is False
+        g = groups.setdefault(bad, ([], [], [], [], []))
+        g[0].append(rr * 1.02); g[1].append(0.0); g[2].append(L.agl_of(ft))
+        tag = f'{label}  {ft:.2f} ft'
+        hv = f'{label}<br>{ft:.2f} ft from top · {L.agl_of(ft):.2f} ft AGL'
+        if r is not None and r.gap is not None and r.station.checked:
+            hv += (f'<br>{kind}: {r.gap:.2f} ft to slip joint {r.joint_no} '
+                   f'(needs {r.station.clearance:.2f})')
+            if bad:
+                tag += f'  ✗ {r.gap:.2f} < {r.station.clearance:.2f}' if r.gap > 0 else '  ✗ in slip joint'
+        g[3].append(tag); g[4].append(hv)
+        # bracket / vang band as a plate on the +x face
+        if r is not None and r.station.kind != 'None' and (r.station.above + r.station.below) > 0:
+            s = r.station
+            w = rr * 0.55
+            data.append(_box(rr, rr + 0.35, -w, w, L.agl_of(s.band_bot), L.agl_of(s.band_top),
+                             C_BAD if bad else C_BRK,
+                             f'{label} {s.kind}<br>{s.above:.2f} ft above · {s.below:.2f} ft below'))
+    for bad, (xs, ys, zs, txt, hov) in groups.items():
+        col = C_BAD if bad else C_CLAMP
         data.append(go.Scatter3d(x=xs, y=ys, z=zs, mode='markers+text', text=txt,
                                  textposition='middle right',
-                                 textfont=dict(color=C_CLAMP, size=12),
-                                 marker=dict(size=6, color=C_CLAMP, symbol='diamond'),
+                                 textfont=dict(color=col, size=12),
+                                 marker=dict(size=6, color=col, symbol='diamond'),
                                  hovertext=hov, hoverinfo='text', showlegend=False))
 
     zmin = -L.embedment

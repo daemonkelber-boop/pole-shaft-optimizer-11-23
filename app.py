@@ -123,10 +123,12 @@ tmp_path = save_xml(uploaded.getvalue()) if uploaded else None
 
 
 # ── Pole diagram helper ────────────────────────────────────────────────────
-def _draw_pole_diagram(spec, base, SB, clamp_names=None):
+def _draw_pole_diagram(spec, base, SB, clamp_names=None, keepout=None):
     """Return a matplotlib figure replicating the PLS-POLE elevation view.
-    clamp_names: {XML joint label: display name}, e.g. {'P:C1': 'C1'}."""
+    clamp_names: {XML joint label: display name}, e.g. {'P:C1': 'C1'}.
+    keepout: list of keepout.Result -- bracket/vang bands and clashes."""
     clamp_names = clamp_names or {}
+    keepout = keepout or []
     import numpy as np
     import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
@@ -231,6 +233,38 @@ def _draw_pole_diagram(spec, base, SB, clamp_names=None):
             xf = face_half(yi) * 1.55
             ax.plot([-xf, xf], [yi, yi], color=C_DIM, lw=0.9,
                     linestyle='--', alpha=0.7, zorder=4)
+
+    # ---- 2b. bracket / vang bands and clearance clashes ---------------------
+    bad_joints = {r.joint_no for r in keepout if r.ok is False}
+    sj_no = 0
+    for tb in lay:
+        if tb['lap'] <= 0 or tb is lay[-1]:
+            continue
+        sj_no += 1
+        if sj_no in bad_joints:
+            y_lap_t = y(tb['end'] - tb['lap']); y_lap_b = y(tb['end'])
+            xf = max(face_half(y_lap_t), face_half(y_lap_b)) * 1.25
+            ax.add_patch(mpatches.Rectangle((-xf, y_lap_b), 2 * xf, y_lap_t - y_lap_b,
+                         fill=False, edgecolor='#D50000', lw=2.0, zorder=7))
+    for r in keepout:
+        s = r.station
+        if s.kind == 'None' and s.clearance <= 0 and s.source == 'XML':
+            continue
+        y_pt = y(s.from_top)
+        y_bt, y_bb = y(s.band_top), y(s.band_bot)
+        xf = face_half(y_pt)
+        col = '#D50000' if r.ok is False else '#546E7A'
+        if y_bt - y_bb > 0.01:
+            ax.add_patch(mpatches.Rectangle((-xf - 1.2, y_bb), 1.2, y_bt - y_bb,
+                         facecolor=col, alpha=0.35, edgecolor=col, lw=1.0, zorder=6))
+        if s.source == 'user':
+            ax.plot(-xf, y_pt, 's', color=col, ms=5, zorder=6)
+            ax.text(-xf - 1.4, y_pt, s.label, fontsize=8, ha='right', va='center',
+                    color=col, fontweight='bold')
+        if r.ok is False:
+            ax.text(-xf - 1.4, y_pt - 1.2,
+                    f'needs {s.clearance:.2f}, has {r.gap:.2f}' if r.gap > 0 else 'inside slip joint',
+                    fontsize=7.5, ha='right', va='top', color='#D50000')
 
     # ========================================================================
     # 3. GROUND LINE
@@ -1937,23 +1971,130 @@ with tab8:
             m[3].metric("Slip joints", f"{len(L8.slip_joints)}")
             m[4].metric("Base plate" if L8.base_plate else "Embedded", f"Ø{L8.base_plate.diameter:.1f} in" if L8.base_plate else f"{L8.embedment:.2f} ft")
 
+            # ---- brackets / vangs and clearance to slip joints -------------
+            from keepout import Station, TYPES, check
+            st.subheader("Brackets, vangs and clearance to slip joints")
+            st.caption(
+                "Each row is an elevation on the pole: clamps come from the XML, and you can "
+                "add rows for other brackets or vangs. Choose **Bracket** or **Vang**, give "
+                "the band it covers **above** and **below** the elevation, and the **clearance** "
+                "you need from that band to the nearest slip joint (top of male to bottom of "
+                "female). A row is checked when it has a bracket/vang or a clearance > 0. "
+                "Defaults are 0: nothing is assumed.")
+            fkey = os.path.basename(tmp_path)
+            ko_key, ver_key = f"ko_{fkey}", f"ko_ver_{fkey}"
+            if ko_key not in st.session_state:
+                st.session_state[ko_key] = pd.DataFrame([{
+                    "Item": a.label, "from_top": a.from_top, "Bracket / vang": "None",
+                    "Above (ft)": 0.0, "Below (ft)": 0.0, "Clearance (ft)": 0.0,
+                    "Source": "XML"} for a in L8.attachments])
+                st.session_state[ver_key] = 0
+            canon = st.session_state[ko_key]
+
+            r1 = st.columns([1.3, 1, 0.8, 0.8])
+            ref = r1[0].radio("Enter elevations as", ["From pole top", "Above ground line"],
+                              horizontal=True, key=f"ko_ref_{fkey}")
+            fill = r1[1].number_input("Clearance for every row (ft)", min_value=0.0,
+                                      step=0.25, value=0.0, key=f"ko_fill_{fkey}")
+            if r1[2].button("Apply to all rows", key=f"ko_fillbtn_{fkey}"):
+                canon = canon.copy(); canon["Clearance (ft)"] = float(fill)
+                st.session_state[ko_key] = canon
+                st.session_state[ver_key] += 1
+                st.rerun()
+            if r1[3].button("Reset to XML", key=f"ko_reset_{fkey}"):
+                del st.session_state[ko_key]
+                st.session_state[ver_key] = st.session_state.get(ver_key, 0) + 1
+                st.rerun()
+
+            from_gl = ref == "Above ground line"
+            ecol = "Elevation above GL (ft)" if from_gl else "Elevation from top (ft)"
+            show = canon.copy()
+            show.insert(1, ecol, (L8.agl_height - show["from_top"]) if from_gl else show["from_top"])
+            show = show.drop(columns=["from_top"])
+            edited = st.data_editor(
+                show, num_rows="dynamic", hide_index=True, width="stretch",
+                key=f"ko_editor_{fkey}_{st.session_state[ver_key]}_{int(from_gl)}",
+                column_config={
+                    "Item": st.column_config.TextColumn(required=True),
+                    ecol: st.column_config.NumberColumn(format="%.2f", step=0.25, required=True,
+                                                        min_value=-L8.embedment if from_gl else 0.0),
+                    "Bracket / vang": st.column_config.SelectboxColumn(options=TYPES, required=True),
+                    "Above (ft)": st.column_config.NumberColumn(format="%.2f", min_value=0.0, step=0.25),
+                    "Below (ft)": st.column_config.NumberColumn(format="%.2f", min_value=0.0, step=0.25),
+                    "Clearance (ft)": st.column_config.NumberColumn(format="%.2f", min_value=0.0, step=0.25),
+                    "Source": st.column_config.TextColumn(disabled=True),
+                })
+            new_canon = edited.copy()
+            new_canon["Source"] = new_canon["Source"].fillna("user")
+            for c_ in ["Above (ft)", "Below (ft)", "Clearance (ft)"]:
+                new_canon[c_] = pd.to_numeric(new_canon[c_], errors="coerce").fillna(0.0)
+            new_canon["Bracket / vang"] = new_canon["Bracket / vang"].fillna("None")
+            new_canon["Item"] = new_canon["Item"].fillna("")
+            elev = pd.to_numeric(new_canon[ecol], errors="coerce")
+            new_canon = new_canon[elev.notna()].copy()
+            elev = elev[elev.notna()]
+            new_canon.insert(1, "from_top", ((L8.agl_height - elev) if from_gl else elev).round(4))
+            new_canon = new_canon.drop(columns=[ecol]).reset_index(drop=True)
+
+            def _sig(df_):
+                return [(str(a), round(float(b), 4), str(c), round(float(d), 4),
+                         round(float(e), 4), round(float(f), 4), str(g))
+                        for a, b, c, d, e, f, g in df_[["Item", "from_top", "Bracket / vang",
+                                                        "Above (ft)", "Below (ft)",
+                                                        "Clearance (ft)", "Source"]].itertuples(index=False)]
+            if _sig(new_canon) != _sig(canon):
+                st.session_state[ko_key] = new_canon
+                st.session_state[ver_key] += 1
+                st.rerun()
+
+            stations = [Station(label=str(r_["Item"]) or f"row {i_ + 1}",
+                                from_top=float(r_["from_top"]),
+                                kind=str(r_["Bracket / vang"]),
+                                above=float(r_["Above (ft)"]), below=float(r_["Below (ft)"]),
+                                clearance=float(r_["Clearance (ft)"]),
+                                source=str(r_["Source"]))
+                        for i_, r_ in canon.reset_index(drop=True).iterrows()]
+            res8 = check(stations, L8.slip_joints)
+            n_chk = sum(r_.ok is not None for r_ in res8)
+            n_bad = sum(r_.ok is False for r_ in res8)
+            if n_chk == 0:
+                st.info("No rows checked yet. Set a bracket/vang or a clearance on any row.")
+            elif n_bad:
+                st.error(f"✗ {n_bad} of {n_chk} checked elevations are too close to a slip joint.")
+            else:
+                st.success(f"✓ All {n_chk} checked elevations clear their nearest slip joint.")
+            st.dataframe(pd.DataFrame([{
+                "Item": r_.station.label, "Type": r_.station.kind,
+                "From top (ft)": r_.station.from_top,
+                "Above GL (ft)": L8.agl_of(r_.station.from_top),
+                "Band (from top, ft)": f"{r_.station.band_top:.2f} – {r_.station.band_bot:.2f}",
+                "Nearest slip joint": "—" if r_.joint_no is None else
+                    f"#{r_.joint_no} ({L8.slip_joints[r_.joint_no - 1].top_from_top:.2f} – "
+                    f"{L8.slip_joints[r_.joint_no - 1].bot_from_top:.2f})",
+                "Position": r_.side,
+                "Clear distance (ft)": r_.gap,
+                "Required (ft)": r_.station.clearance,
+                "Result": {True: "✓ OK", False: "✗ too close", None: "not checked"}[r_.ok],
+            } for r_ in res8]).round(2), width="stretch", hide_index=True)
+
             c2d, c3d = st.columns([1, 1])
             with c2d:
                 st.markdown("**Elevation with dimensions** (ft; width drawn 1.6× for clarity)")
                 names8 = {a.joint: a.label for a in L8.attachments}
-                fig8 = _draw_pole_diagram(spec8, base8, SB, clamp_names=names8)
+                fig8 = _draw_pole_diagram(spec8, base8, SB, clamp_names=names8, keepout=res8)
                 st.pyplot(fig8, width="stretch")
                 plt.close(fig8)
             with c3d:
                 st.markdown("**3D model** (true scale; drag to rotate, scroll to zoom)")
-                st.plotly_chart(build_figure(L8, SB), width="stretch",
+                st.plotly_chart(build_figure(L8, SB, results=res8), width="stretch",
                                 config={"displaylogo": False})
                 st.caption("Amber = slip joint zone (top of male to bottom of female). "
-                           "Red diamonds = clamps, all drawn on one face. "
-                           "The XML gives clamp heights only, not their side of the pole.")
+                           "Blue diamonds = elevations, all drawn on one face (the XML gives "
+                           "clamp heights only, not their side). Dark plates = brackets/vangs. "
+                           "Red = too close to a slip joint.")
 
-            st.subheader("Locations on the pole")
-            st.dataframe(pd.DataFrame(location_rows(L8)).round(2), width="stretch",
-                         hide_index=True)
+            with st.expander("All locations on the pole"):
+                st.dataframe(pd.DataFrame(location_rows(L8)).round(2), width="stretch",
+                             hide_index=True)
         except Exception as e:
             show_error(e)
