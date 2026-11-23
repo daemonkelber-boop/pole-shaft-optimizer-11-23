@@ -155,6 +155,10 @@ class OptConstraints:
     #: Shaft-only ranking; a shaft with no feasible plate/anchor-bolt
     #: layout is rejected and the next-ranked shaft is promoted.
     bp_rules: Optional[BasePlateRules] = None
+    #: bracket / vang clearance to slip joints (keepout.Station list).
+    #: Empty = off. Hard rule: a candidate whose slip joint zone breaks any
+    #: station is rejected, and the splice-height search skips those splices.
+    keepout: List = field(default_factory=list)
 
     @property
     def long_tube_threshold_pct(self) -> float:
@@ -293,6 +297,15 @@ def make_spec(d: Design, H: float, emb: float, C: OptConstraints,
         clear = spec.groundline_rel - low['lap_bottom']
         if clear < C.min_slip_above_gl - 1e-9:
             return None, f"lowest slip joint {clear:.2f} ft above GL < {C.min_slip_above_gl}"
+    if C.keepout:
+        from keepout import zone_conflict
+        for tb in slips:
+            for st_ in C.keepout:
+                why = zone_conflict(tb['lap_top'], tb['lap_bottom'], st_)
+                if why:
+                    return None, (f"slip joint below tube {tb['tube_no']} "
+                                  f"({tb['lap_top']:.2f}-{tb['lap_bottom']:.2f} ft from top) "
+                                  f"vs {st_.label}: {why}")
     if abs(spec.base_diameter - d.base) > 0.01:     # internal consistency
         return None, f"base D {spec.base_diameter:.3f} != {d.base}"
     return spec, ''
@@ -529,6 +542,15 @@ class Optimizer:
         for b in range(N + 1):
             fid = (D[b] - 2.0 * 0.5) / 12.0
             lap_idx[b] = int(math.ceil(slip_joint_lap(fid, C.lap_factor, C.lap_round) / step - 1e-9))
+        # bracket / vang keep-outs: splice ends (female bottom at index b)
+        # whose lap zone would break a station are blocked
+        ko_ok = np.ones(N + 1, dtype=bool)
+        if C.keepout:
+            from keepout import zone_conflict
+            for b in range(N + 1):
+                zt, zb = (b - lap_idx[b]) * step, b * step
+                if any(zone_conflict(zt, zb, st_) for st_ in C.keepout):
+                    ko_ok[b] = False
         caps = np.array([C.max_length_for_thickness(g) or 1e9 for g in G] + [0.0])
         Gw = np.append(Garr, 1e9)                                 # weight per gauge idx
         gi = np.arange(len(G) + 1)
@@ -587,6 +609,8 @@ class Optimizer:
                     tot[:, BIG] = INF
                     tot[:, caps < l * step - 1e-6] = INF
                     nxt = b_ - (lap_idx[b_] if jt == 'slip' else 0)
+                    if jt == 'slip' and C.keepout:
+                        tot[~ko_ok[b_], :] = INF
                     old = new[nxt].copy()
                     np.minimum.at(new, nxt, tot)       # nxt can repeat
                     win = (tot < old) & (tot == new[nxt])

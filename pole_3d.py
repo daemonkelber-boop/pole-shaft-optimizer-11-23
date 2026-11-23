@@ -93,7 +93,7 @@ def _box(x0, x1, y0, y1, z0, z1, color, hover, opacity=1.0):
 def build_figure(L: PoleLayout, T: dict, height_px: int = 900, results=None) -> go.Figure:
     """T = Style B tokens (style_b.tokens()). results = keepout.check() output."""
     results = results or []
-    bad_joints = {r.joint_no for r in results if r.ok is False}
+    bad_joints = set().union(*[r.bad_joints for r in results]) if results else set()
     C_STEEL = '#9aa7ad' if T.get('text', '#000').startswith('#0') else '#7f8d94'
     C_EDGE = T.get('chart_ring', '#073247')
     C_LAP = T.get('warning', '#e08d17')
@@ -136,19 +136,24 @@ def build_figure(L: PoleLayout, T: dict, height_px: int = 900, results=None) -> 
         g[0].append(rr * 1.02); g[1].append(0.0); g[2].append(L.agl_of(ft))
         tag = f'{label}  {ft:.2f} ft'
         hv = f'{label}<br>{ft:.2f} ft from top · {L.agl_of(ft):.2f} ft AGL'
-        if r is not None and r.gap is not None and r.station.checked:
-            hv += (f'<br>{kind}: {r.gap:.2f} ft to slip joint {r.joint_no} '
-                   f'(needs {r.station.clearance:.2f})')
+        if r is not None and r.station.checked:
+            s_ = r.station
+            if s_.kind != 'None':
+                hv += f'<br>{s_.kind} {s_.height_in:.2f} in'
+            if r.gap_above is not None:
+                hv += f'<br>{r.gap_above:.2f} ft to joint {r.above_no} above (needs {s_.clr_above:.2f})'
+            if r.gap_below is not None:
+                hv += f'<br>{r.gap_below:.2f} ft to joint {r.below_no} below (needs {s_.clr_below:.2f})'
             if bad:
-                tag += f'  ✗ {r.gap:.2f} < {r.station.clearance:.2f}' if r.gap > 0 else '  ✗ in slip joint'
+                tag += f'  ✗ {r.reason}'
         g[3].append(tag); g[4].append(hv)
         # bracket / vang band as a plate on the +x face
-        if r is not None and r.station.kind != 'None' and (r.station.above + r.station.below) > 0:
+        if r is not None and r.station.kind != 'None' and r.station.height_in > 0:
             s = r.station
             w = rr * 0.55
             data.append(_box(rr, rr + 0.35, -w, w, L.agl_of(s.band_bot), L.agl_of(s.band_top),
                              C_BAD if bad else C_BRK,
-                             f'{label} {s.kind}<br>{s.above:.2f} ft above · {s.below:.2f} ft below'))
+                             f'{label} {s.kind} {s.height_in:.2f} in'))
     for bad, (xs, ys, zs, txt, hov) in groups.items():
         col = C_BAD if bad else C_CLAMP
         data.append(go.Scatter3d(x=xs, y=ys, z=zs, mode='markers+text', text=txt,

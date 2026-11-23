@@ -235,7 +235,7 @@ def _draw_pole_diagram(spec, base, SB, clamp_names=None, keepout=None):
                     linestyle='--', alpha=0.7, zorder=4)
 
     # ---- 2b. bracket / vang bands and clearance clashes ---------------------
-    bad_joints = {r.joint_no for r in keepout if r.ok is False}
+    bad_joints = set().union(*[r.bad_joints for r in keepout]) if keepout else set()
     sj_no = 0
     for tb in lay:
         if tb['lap'] <= 0 or tb is lay[-1]:
@@ -248,7 +248,7 @@ def _draw_pole_diagram(spec, base, SB, clamp_names=None, keepout=None):
                          fill=False, edgecolor='#D50000', lw=2.0, zorder=7))
     for r in keepout:
         s = r.station
-        if s.kind == 'None' and s.clearance <= 0 and s.source == 'XML':
+        if not s.checked and s.source == 'XML':
             continue
         y_pt = y(s.from_top)
         y_bt, y_bb = y(s.band_top), y(s.band_bot)
@@ -262,8 +262,7 @@ def _draw_pole_diagram(spec, base, SB, clamp_names=None, keepout=None):
             ax.text(-xf - 1.4, y_pt, s.label, fontsize=8, ha='right', va='center',
                     color=col, fontweight='bold')
         if r.ok is False:
-            ax.text(-xf - 1.4, y_pt - 1.2,
-                    f'needs {s.clearance:.2f}, has {r.gap:.2f}' if r.gap > 0 else 'inside slip joint',
+            ax.text(-xf - 1.4, y_pt - 1.2, r.reason,
                     fontsize=7.5, ha='right', va='top', color='#D50000')
 
     # ========================================================================
@@ -447,6 +446,24 @@ def _draw_pole_diagram(spec, base, SB, clamp_names=None, keepout=None):
 
     plt.tight_layout(pad=0.5)
     return fig
+
+
+KO_COLS = ["Item", "from_top", "Bracket / vang", "Height (in)",
+           "Clear to joint above (ft)", "Clear to joint below (ft)", "Source"]
+
+
+def ko_table(L, path):
+    """Bracket / vang clearance table for this XML (canonical: 'from_top' in ft).
+    Shared by Tab 8 (edit) and Tab 6 (optimizer). Defaults are all 0."""
+    k = f"ko_{os.path.basename(path)}"
+    if k not in st.session_state:
+        st.session_state[k] = pd.DataFrame([{
+            "Item": a.label, "from_top": a.from_top, "Bracket / vang": "None",
+            "Height (in)": 0.0, "Clear to joint above (ft)": 0.0,
+            "Clear to joint below (ft)": 0.0, "Source": "XML"} for a in L.attachments],
+            columns=KO_COLS)
+        st.session_state[f"ko_ver_{os.path.basename(path)}"] = 0
+    return st.session_state[k]
 
 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
@@ -1090,7 +1107,7 @@ with tab6:
                 strength_target=100.0, defl_target=100.0, tolerance_pct=0.0,
                 fab_penalty_pct=2.0,
                 n_alternates=10, log_all=False, time_limit_min=15.0, max_evals=200000,
-                bp_on=True)
+                bp_on=True, ko_on=False)
             for k, v in DEF.items():
                 st.session_state.setdefault(f"o_{k}", v)
             if st.button("↺ Reset all constraints to defaults"):
@@ -1253,6 +1270,29 @@ with tab6:
                                  "tube or moves to a larger base when needed. Uses the Tab 7 settings and "
                                  "the baseline base reactions; every reported design is then re-checked "
                                  "with its own reactions. Compare plate options in Tab 7.")
+                st.markdown("**Special: bracket / vang clearance to slip joints**")
+                from pole_layout import build_layout as _bl6
+                from keepout import stations_from_df as _sdf6
+                _L6 = _bl6(spec6, base6, p6)
+                _ko6 = [s_ for s_ in _sdf6(ko_table(_L6, tmp_path)) if s_.checked]
+                st.checkbox("Enforce bracket / vang clearances in the search", key="o_ko_on",
+                            help="Hard rule. Every candidate's slip joints (top of male to bottom of "
+                                 "female) must clear each checked row of the table in Tab 8 · Pole "
+                                 "View: no overlap, and at least the required distance to the slip "
+                                 "joint above and below. The splice-height search skips splice "
+                                 "positions that break a row. Edit the rows in Tab 8, click Update "
+                                 "there, then run.")
+                if _ko6:
+                    st.dataframe(pd.DataFrame([{
+                        "Item": s_.label, "From top (ft)": round(s_.from_top, 2),
+                        "Above GL (ft)": round(_L6.agl_of(s_.from_top), 2), "Type": s_.kind,
+                        "Height (in)": s_.height_in, "Clear above (ft)": s_.clr_above,
+                        "Clear below (ft)": s_.clr_below} for s_ in _ko6]),
+                        width="stretch", hide_index=True)
+                else:
+                    st.caption("No checked rows yet: set brackets/vangs or clearances in "
+                               "Tab 8 · Pole View and click Update there. With no rows, enforcing "
+                               "changes nothing.")
                 st.checkbox("Log every candidate tried", key="o_log_all")
                 go_run = st.form_submit_button("▶ Run optimizer", type="primary")
 
@@ -1340,7 +1380,8 @@ with tab6:
                     time_limit_s=float(S.o_time_limit_min) * 60.0,
                     max_evaluations=int(S.o_max_evals),
                     coarse_len_values=_coarse6,
-                    bp_rules=_bp_rules(p6, S) if S.o_bp_on else None)
+                    bp_rules=_bp_rules(p6, S) if S.o_bp_on else None,
+                    keepout=(_ko6 if S.get("o_ko_on") else []))
 
                 run_hdr = st.empty()
                 run_hdr.subheader("Running")
@@ -1428,6 +1469,12 @@ with tab6:
                 elif win is None:
                     st.error("No design satisfied all constraints and load cases. "
                              "Widen the diameter / thickness / taper ranges and re-run.")
+                    if getattr(C6, "keepout", None):
+                        st.warning("Bracket / vang clearances were enforced. They may leave no room "
+                                   "for slip joints: each slip joint needs a free stretch of pole about "
+                                   "as long as its lap, plus the clearances above and below each row, "
+                                   "and no tube may exceed the max length. Reduce the clearances or "
+                                   "untick the rule to see the unconstrained design.")
                 else:
                     sw = summarize(win, C6)
                     st.subheader("Recommended design")
@@ -1450,6 +1497,28 @@ with tab6:
                     if sw["acceptance"] == "within tolerance":
                         st.info(f"Accepted within the {C6.tolerance_pct:g}% tolerance (usage above the "
                                 f"{C6.strength_target:g}% target).")
+                    if getattr(C6, "keepout", None):
+                        from pole_layout import build_layout as _blw
+                        from keepout import check as _kchk
+                        _Lw = _blw(win.spec)
+                        _rw = _kchk(C6.keepout, _Lw.slip_joints)
+                        _nb = sum(r_.ok is False for r_ in _rw)
+                        (st.success if _nb == 0 else st.error)(
+                            f"Bracket / vang clearances enforced ({len(C6.keepout)} rows): "
+                            + ("recommended design clears all of them." if _nb == 0
+                               else f"{_nb} row(s) fail — please report this."))
+                        with st.expander("Clearance check of the recommended design"):
+                            st.dataframe(pd.DataFrame([{
+                                "Item": r_.station.label, "From top (ft)": r_.station.from_top,
+                                "Gap to joint above (ft)": r_.gap_above,
+                                "Need above (ft)": r_.station.clr_above,
+                                "Gap to joint below (ft)": r_.gap_below,
+                                "Need below (ft)": r_.station.clr_below,
+                                "Result": "✓ OK" if r_.ok else "✗ " + r_.reason,
+                            } for r_ in _rw]).round(2), width="stretch", hide_index=True)
+                            st.caption("Slip joints of this design (from top): " + ", ".join(
+                                f"#{j_.no} {j_.top_from_top:.2f}–{j_.bot_from_top:.2f}"
+                                for j_ in _Lw.slip_joints))
                     for f_, v_ in (("tip", sw["D tip (in)"]), ("base", sw["D base (in)"])):
                         lim = (C6.tip_min, C6.tip_max) if f_ == "tip" else (C6.base_min, C6.base_max)
                         if abs(v_ - lim[0]) < 1e-6 or abs(v_ - lim[1]) < 1e-6:
@@ -1972,109 +2041,110 @@ with tab8:
             m[4].metric("Base plate" if L8.base_plate else "Embedded", f"Ø{L8.base_plate.diameter:.1f} in" if L8.base_plate else f"{L8.embedment:.2f} ft")
 
             # ---- brackets / vangs and clearance to slip joints -------------
-            from keepout import Station, TYPES, check
+            from keepout import TYPES, check, stations_from_df
             st.subheader("Brackets, vangs and clearance to slip joints")
             st.caption(
-                "Each row is an elevation on the pole: clamps come from the XML, and you can "
-                "add rows for other brackets or vangs. Choose **Bracket** or **Vang**, give "
-                "the band it covers **above** and **below** the elevation, and the **clearance** "
-                "you need from that band to the nearest slip joint (top of male to bottom of "
-                "female). A row is checked when it has a bracket/vang or a clearance > 0. "
-                "Defaults are 0: nothing is assumed.")
+                "One row per elevation: clamps come from the XML; add rows for other brackets or "
+                "vangs. Set **Bracket** or **Vang** and its **overall height (in)** — it is split "
+                "half above and half below the elevation. Then set the clear distance you need from "
+                "the bracket/vang **top to the slip joint above** and from its **bottom to the slip "
+                "joint below** (ft). Slip joint = top of male to bottom of female. A row is checked "
+                "when it has a bracket/vang or a clearance > 0; defaults are 0 (nothing assumed). "
+                "**Edits apply when you click Update.** The Optimizer tab can enforce these rows.")
             fkey = os.path.basename(tmp_path)
-            ko_key, ver_key = f"ko_{fkey}", f"ko_ver_{fkey}"
-            if ko_key not in st.session_state:
-                st.session_state[ko_key] = pd.DataFrame([{
-                    "Item": a.label, "from_top": a.from_top, "Bracket / vang": "None",
-                    "Above (ft)": 0.0, "Below (ft)": 0.0, "Clearance (ft)": 0.0,
-                    "Source": "XML"} for a in L8.attachments])
-                st.session_state[ver_key] = 0
-            canon = st.session_state[ko_key]
-
-            r1 = st.columns([1.3, 1, 0.8, 0.8])
-            ref = r1[0].radio("Enter elevations as", ["From pole top", "Above ground line"],
-                              horizontal=True, key=f"ko_ref_{fkey}")
-            fill = r1[1].number_input("Clearance for every row (ft)", min_value=0.0,
-                                      step=0.25, value=0.0, key=f"ko_fill_{fkey}")
-            if r1[2].button("Apply to all rows", key=f"ko_fillbtn_{fkey}"):
-                canon = canon.copy(); canon["Clearance (ft)"] = float(fill)
-                st.session_state[ko_key] = canon
-                st.session_state[ver_key] += 1
-                st.rerun()
-            if r1[3].button("Reset to XML", key=f"ko_reset_{fkey}"):
-                del st.session_state[ko_key]
-                st.session_state[ver_key] = st.session_state.get(ver_key, 0) + 1
-                st.rerun()
-
-            from_gl = ref == "Above ground line"
+            ver_key = f"ko_ver_{fkey}"
+            canon = ko_table(L8, tmp_path)
+            ref_used = st.session_state.get(f"ko_ref_used_{fkey}", "From pole top")
+            from_gl = ref_used == "Above ground line"
             ecol = "Elevation above GL (ft)" if from_gl else "Elevation from top (ft)"
             show = canon.copy()
             show.insert(1, ecol, (L8.agl_height - show["from_top"]) if from_gl else show["from_top"])
             show = show.drop(columns=["from_top"])
-            edited = st.data_editor(
-                show, num_rows="dynamic", hide_index=True, width="stretch",
-                key=f"ko_editor_{fkey}_{st.session_state[ver_key]}_{int(from_gl)}",
-                column_config={
-                    "Item": st.column_config.TextColumn(required=True),
-                    ecol: st.column_config.NumberColumn(format="%.2f", step=0.25, required=True,
-                                                        min_value=-L8.embedment if from_gl else 0.0),
-                    "Bracket / vang": st.column_config.SelectboxColumn(options=TYPES, required=True),
-                    "Above (ft)": st.column_config.NumberColumn(format="%.2f", min_value=0.0, step=0.25),
-                    "Below (ft)": st.column_config.NumberColumn(format="%.2f", min_value=0.0, step=0.25),
-                    "Clearance (ft)": st.column_config.NumberColumn(format="%.2f", min_value=0.0, step=0.25),
-                    "Source": st.column_config.TextColumn(disabled=True),
-                })
-            new_canon = edited.copy()
-            new_canon["Source"] = new_canon["Source"].fillna("user")
-            for c_ in ["Above (ft)", "Below (ft)", "Clearance (ft)"]:
-                new_canon[c_] = pd.to_numeric(new_canon[c_], errors="coerce").fillna(0.0)
-            new_canon["Bracket / vang"] = new_canon["Bracket / vang"].fillna("None")
-            new_canon["Item"] = new_canon["Item"].fillna("")
-            elev = pd.to_numeric(new_canon[ecol], errors="coerce")
-            new_canon = new_canon[elev.notna()].copy()
-            elev = elev[elev.notna()]
-            new_canon.insert(1, "from_top", ((L8.agl_height - elev) if from_gl else elev).round(4))
-            new_canon = new_canon.drop(columns=[ecol]).reset_index(drop=True)
 
-            def _sig(df_):
-                return [(str(a), round(float(b), 4), str(c), round(float(d), 4),
-                         round(float(e), 4), round(float(f), 4), str(g))
-                        for a, b, c, d, e, f, g in df_[["Item", "from_top", "Bracket / vang",
-                                                        "Above (ft)", "Below (ft)",
-                                                        "Clearance (ft)", "Source"]].itertuples(index=False)]
-            if _sig(new_canon) != _sig(canon):
-                st.session_state[ko_key] = new_canon
+            with st.form(f"ko_form_{fkey}"):
+                f1 = st.columns([1.4, 1, 1])
+                ref_new = f1[0].radio("Enter elevations as", ["From pole top", "Above ground line"],
+                                      index=1 if from_gl else 0, horizontal=True,
+                                      key=f"ko_ref_{fkey}",
+                                      help="Switches the elevation column on Update.")
+                fa = f1[1].number_input("Fill: clear to joint above (ft)", min_value=0.0, step=0.25,
+                                        value=0.0, key=f"ko_fa_{fkey}")
+                fb = f1[2].number_input("Fill: clear to joint below (ft)", min_value=0.0, step=0.25,
+                                        value=0.0, key=f"ko_fb_{fkey}")
+                edited = st.data_editor(
+                    show, num_rows="dynamic", hide_index=True, width="stretch",
+                    key=f"ko_editor_{fkey}_{st.session_state[ver_key]}",
+                    column_config={
+                        "Item": st.column_config.TextColumn(required=True),
+                        ecol: st.column_config.NumberColumn(
+                            format="%.2f", step=0.25, required=True,
+                            min_value=-L8.embedment if from_gl else 0.0),
+                        "Bracket / vang": st.column_config.SelectboxColumn(options=TYPES, required=True),
+                        "Height (in)": st.column_config.NumberColumn(format="%.2f", min_value=0.0,
+                                                                     step=0.5,
+                                                                     help="Overall height; half above, half below"),
+                        "Clear to joint above (ft)": st.column_config.NumberColumn(
+                            format="%.2f", min_value=0.0, step=0.25,
+                            help="Bracket/vang top to the bottom of the slip joint above"),
+                        "Clear to joint below (ft)": st.column_config.NumberColumn(
+                            format="%.2f", min_value=0.0, step=0.25,
+                            help="Bracket/vang bottom to the top of the slip joint below"),
+                        "Source": st.column_config.TextColumn(disabled=True),
+                    })
+                b1 = st.columns([1, 1, 3])
+                do_update = b1[0].form_submit_button("Update check & views", type="primary")
+                do_fill = b1[1].form_submit_button("Fill all rows + update")
+
+            if st.button("Reset table to XML", key=f"ko_reset_{fkey}"):
+                del st.session_state[f"ko_{fkey}"]
+                st.session_state[ver_key] = st.session_state.get(ver_key, 0) + 1
+                st.rerun()
+
+            if do_update or do_fill:
+                nc = edited.copy()
+                nc["Source"] = nc["Source"].fillna("user")
+                for c_ in ["Height (in)", "Clear to joint above (ft)", "Clear to joint below (ft)"]:
+                    nc[c_] = pd.to_numeric(nc[c_], errors="coerce").fillna(0.0)
+                nc["Bracket / vang"] = nc["Bracket / vang"].fillna("None")
+                nc["Item"] = nc["Item"].fillna("")
+                elev = pd.to_numeric(nc[ecol], errors="coerce")
+                nc = nc[elev.notna()].copy()
+                elev = elev[elev.notna()]
+                nc.insert(1, "from_top", ((L8.agl_height - elev) if from_gl else elev).round(4))
+                nc = nc.drop(columns=[ecol])[KO_COLS].reset_index(drop=True)
+                if do_fill:
+                    nc["Clear to joint above (ft)"] = float(fa)
+                    nc["Clear to joint below (ft)"] = float(fb)
+                st.session_state[f"ko_{fkey}"] = nc
+                st.session_state[f"ko_ref_used_{fkey}"] = ref_new
                 st.session_state[ver_key] += 1
                 st.rerun()
 
-            stations = [Station(label=str(r_["Item"]) or f"row {i_ + 1}",
-                                from_top=float(r_["from_top"]),
-                                kind=str(r_["Bracket / vang"]),
-                                above=float(r_["Above (ft)"]), below=float(r_["Below (ft)"]),
-                                clearance=float(r_["Clearance (ft)"]),
-                                source=str(r_["Source"]))
-                        for i_, r_ in canon.reset_index(drop=True).iterrows()]
-            res8 = check(stations, L8.slip_joints)
+            res8 = check(stations_from_df(canon), L8.slip_joints)
             n_chk = sum(r_.ok is not None for r_ in res8)
             n_bad = sum(r_.ok is False for r_ in res8)
             if n_chk == 0:
-                st.info("No rows checked yet. Set a bracket/vang or a clearance on any row.")
+                st.info("No rows checked yet. Set a bracket/vang or a clearance on a row, then Update.")
             elif n_bad:
                 st.error(f"✗ {n_bad} of {n_chk} checked elevations are too close to a slip joint.")
             else:
-                st.success(f"✓ All {n_chk} checked elevations clear their nearest slip joint.")
+                st.success(f"✓ All {n_chk} checked elevations clear the slip joints.")
+
+            def _jtxt(no):
+                if no is None:
+                    return "—"
+                j_ = L8.slip_joints[no - 1]
+                return f"#{no} ({j_.top_from_top:.2f}–{j_.bot_from_top:.2f})"
             st.dataframe(pd.DataFrame([{
                 "Item": r_.station.label, "Type": r_.station.kind,
                 "From top (ft)": r_.station.from_top,
                 "Above GL (ft)": L8.agl_of(r_.station.from_top),
-                "Band (from top, ft)": f"{r_.station.band_top:.2f} – {r_.station.band_bot:.2f}",
-                "Nearest slip joint": "—" if r_.joint_no is None else
-                    f"#{r_.joint_no} ({L8.slip_joints[r_.joint_no - 1].top_from_top:.2f} – "
-                    f"{L8.slip_joints[r_.joint_no - 1].bot_from_top:.2f})",
-                "Position": r_.side,
-                "Clear distance (ft)": r_.gap,
-                "Required (ft)": r_.station.clearance,
-                "Result": {True: "✓ OK", False: "✗ too close", None: "not checked"}[r_.ok],
+                "Band from top (ft)": f"{r_.station.band_top:.2f}–{r_.station.band_bot:.2f}",
+                "Slip joint above": _jtxt(r_.above_no),
+                "Gap above (ft)": r_.gap_above, "Need above (ft)": r_.station.clr_above,
+                "Slip joint below": _jtxt(r_.below_no),
+                "Gap below (ft)": r_.gap_below, "Need below (ft)": r_.station.clr_below,
+                "Result": {True: "✓ OK", False: "✗ " + r_.reason, None: "not checked"}[r_.ok],
             } for r_ in res8]).round(2), width="stretch", hide_index=True)
 
             c2d, c3d = st.columns([1, 1])
