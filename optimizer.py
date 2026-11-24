@@ -731,7 +731,12 @@ class Optimizer:
             D = tb['d_top'] + spec.taper * (ss - tb['start'])
             above = ss <= gl
             M = self._cand_env(spec, ss)
-            need = float(np.max(np.where(above, 6.0 * M / (0.411 * D * D * C.fy), 0.0)))
+            # inside this tube's bottom slip lap the strength check uses the
+            # tube below (male), so the female wall is not needed there; skip
+            # those stations to keep the bound optimistic (before this the
+            # bound could exceed the real weight by ~5% and prune winners)
+            own = above & ~(ss > tb['end'] - tb['lap'] + 1e-9) if tb['lap'] > 0 else above
+            need = float(np.max(np.where(own, 6.0 * M / (0.411 * D * D * C.fy), 0.0)))
             need = max(need, 0.268 * tb['d_bot'] /
                        (C.max_wt + 0.268 * (1 + 2 * C.bend_radius_factor)), G[0])
             t_str.append(need)
@@ -782,7 +787,10 @@ class Optimizer:
                 cap = C.max_length_for_thickness(G[idx[k]])
                 if cap is not None and tb['length'] > cap + 1e-6:
                     return None, ()
-        return float(np.dot(c_w, t)), idx
+        # steel area is 3.22 (D - t) t (mid-wall), so take t x per-ft
+        # length back off the outside-diameter weight (as weight.py does)
+        c_len = np.array([3.22 * 12.0 / 1728.0 * 490.0 * (tb['end'] - tb['start']) for tb in lay])
+        return float(np.dot(c_w, t) - np.dot(c_len, t * t)), idx
 
     def _eval(self, d: Design, full: bool = False) -> Tuple[Optional[Evaluated], str]:
         key = (d.tip, d.base, d.uppers, d.ts, full)
