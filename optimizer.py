@@ -149,6 +149,8 @@ class OptConstraints:
     coarse_diam_factor: int = 2               # coarse grid = factor x increment
     coarse_len_values: Tuple[float, ...] = (53.0, 55.0, 57.0, 58.5, 60.0)
     refine_top: int = 6
+    refine_rounds: int = 4                 # refinement repeats while the best improves
+    verify_extra_max: int = 40             # cap on extra full verifications
     max_evaluations: int = 200000          # effectively off; time_limit_s governs
     time_limit_s: float = 900.0               # wall-clock cap for the search phases
     # base plate post-check (base-plate poles only). None = off.
@@ -165,6 +167,13 @@ class OptConstraints:
     #: no length enumeration, baseline layout not seeded); joint types come
     #: from joint_overrides. Diameters, taper and thicknesses are optimized.
     custom_uppers: Optional[Tuple[float, ...]] = None
+    #: fixed shaft (segment) count; None = search 1..max_segments with the
+    #: fabrication-penalty rule
+    n_segments_fixed: Optional[int] = None
+    #: flexible custom layout: (min, max) fabricated length of tubes 1..n-1
+    #: (top -> down; min == max locks a tube). Needs n_segments_fixed. The
+    #: bottom tube takes the rest of the height.
+    tube_len_ranges: Optional[Tuple[Tuple[float, float], ...]] = None
 
     @property
     def long_tube_threshold_pct(self) -> float:
@@ -307,15 +316,27 @@ def make_spec(d: Design, H: float, emb: float, C: OptConstraints,
         clear = spec.groundline_rel - low['lap_bottom']
         if clear < C.min_slip_above_gl - 1e-9:
             return None, f"lowest slip joint {clear:.2f} ft above GL < {C.min_slip_above_gl}"
+    lay_all = spec.layout()
+    if C.n_segments_fixed is not None and len(lay_all) != C.n_segments_fixed:
+        return None, f"{len(lay_all)} shafts, fixed count is {C.n_segments_fixed}"
+    if C.tube_len_ranges:
+        for k, (lo_, hi_) in enumerate(C.tube_len_ranges):
+            if k >= len(lay_all) - 1:
+                break
+            L_ = lay_all[k]['length']
+            if L_ < lo_ - 1e-6 or L_ > hi_ + 1e-6:
+                return None, f"tube {k + 1} {L_:.2f} ft outside {lo_:g}-{hi_:g} ft"
     if C.keepout:
         from keepout import zone_conflict
-        for tb in slips:
+        joints_ = [(tb['tube_no'], tb['lap_top'], tb['lap_bottom'], 'slip') for tb in slips]
+        joints_ += [(tb['tube_no'], tb['end'], tb['end'], 'flange') for tb in lay_all[:-1]
+                    if tb['joint_type'] == 'flange']
+        for no_, zt_, zb_, kind_ in joints_:
             for st_ in C.keepout:
-                why = zone_conflict(tb['lap_top'], tb['lap_bottom'], st_)
+                why = zone_conflict(zt_, zb_, st_)
                 if why:
-                    return None, (f"slip joint below tube {tb['tube_no']} "
-                                  f"({tb['lap_top']:.2f}-{tb['lap_bottom']:.2f} ft from top) "
-                                  f"vs {st_.label}: {why}")
+                    return None, (f"{kind_} joint below tube {no_} "
+                                  f"({zt_:.2f}-{zb_:.2f} ft from top) vs {st_.label}: {why}")
     if abs(spec.base_diameter - d.base) > 0.01:     # internal consistency
         return None, f"base D {spec.base_diameter:.3f} != {d.base}"
     return spec, ''
@@ -401,6 +422,7 @@ class Optimizer:
                      key=lambda x: -x.defl_check['usage'])
         scr += [x.case for x in dcs[:2] if x.case not in scr]
         self.screen_cases = scr
+        self.fine_screen = False          # screening mesh: coarse until shown optimistic
         env_s = b.cases[scr[0]].defl.s
         env = np.zeros_like(env_s)
         for x in b.cases.values():
@@ -460,8 +482,23 @@ class Optimizer:
         C, H = self.C, self.H
         if C.custom_uppers is not None:
             return [tuple(C.custom_uppers)]
+        if C.tube_len_ranges:
+            # flexible custom layout: a few lengths across each tube's range
+            # (the splice-height search fills in the rest)
+            vals = []
+            for lo_, hi_ in C.tube_len_ranges:
+                if hi_ - lo_ < 1e-6:
+                    vals.append([round(lo_, 2)]); continue
+                k_ = max(2, min(5, int((hi_ - lo_) // 2.5) + 1))
+                vals.append(sorted({round(lo_ + (hi_ - lo_) * i / (k_ - 1) * 4) / 4 for i in range(k_)}))
+            n_ = len(C.tube_len_ranges) + 1
+            nj = sum(1 for k in range(1, n_) if C.joint_type(k) == 'slip')
+            return [tuple(u) for u in itertools.product(*vals)
+                    if H - sum(u) + 12.0 * nj >= C.min_tube and H - sum(u) <= C.len_special_max]
         out = []
         for n in range(1, C.max_segments + 1):
+            if C.n_segments_fixed is not None and n != C.n_segments_fixed:
+                continue
             nj = sum(1 for k in range(1, n) if C.joint_type(k) == 'slip')
             lap_hi = 12.0 * nj
             def possible(up, bottom_max):
@@ -544,6 +581,11 @@ class Optimizer:
         CW = np.concatenate([[0.0], np.cumsum((cw[1:] + cw[:-1]) * 0.5 * step)])
         lmin = int(math.ceil(C.min_tube / step - 1e-9))
         lmax = int(math.floor(C.len_normal_max / step + 1e-9))
+        rng = None
+        if C.tube_len_ranges:                     # flexible custom layout
+            rng = [(int(math.ceil(lo_ / step - 1e-9)), int(math.floor(hi_ / step + 1e-9)))
+                   for lo_, hi_ in C.tube_len_ranges]
+            lmax = max([lmax] + [h_ for _, h_ in rng])
         if lmax < lmin:
             return out
         pad = np.concatenate([req, np.full(lmax + 1, BIG)])
@@ -557,12 +599,15 @@ class Optimizer:
         # bracket / vang keep-outs: splice ends (female bottom at index b)
         # whose lap zone would break a station are blocked
         ko_ok = np.ones(N + 1, dtype=bool)
+        ko_ok_f = np.ones(N + 1, dtype=bool)     # flange joint at b (no lap)
         if C.keepout:
             from keepout import zone_conflict
             for b in range(N + 1):
                 zt, zb = (b - lap_idx[b]) * step, b * step
                 if any(zone_conflict(zt, zb, st_) for st_ in C.keepout):
                     ko_ok[b] = False
+                if any(zone_conflict(zb, zb, st_) for st_ in C.keepout):
+                    ko_ok_f[b] = False
         caps = np.array([C.max_length_for_thickness(g) or 1e9 for g in G] + [0.0])
         Gw = np.append(Garr, 1e9)                                 # weight per gauge idx
         gi = np.arange(len(G) + 1)
@@ -600,7 +645,12 @@ class Optimizer:
             val[k_, r] = B[k_, pa[k_, r]]
             return val, src
 
-        for n in range(max(n_lo, 2), min(n_lo + 1, C.max_segments) + 1):
+        n_list = range(max(n_lo, 2), min(n_lo + 1, C.max_segments) + 1)
+        if C.n_segments_fixed is not None:
+            n_list = [C.n_segments_fixed] if C.n_segments_fixed >= 2 else []
+        if rng is not None:
+            n_list = [len(rng) + 1]
+        for n in n_list:
             best = np.full((N + 1, Ga), INF)
             best[0, 0] = 0.0
             ptrs = []                         # per upper tube: (a, l, g_src) arrays
@@ -611,7 +661,9 @@ class Optimizer:
                 pl_ = np.full(best.shape, -1, dtype=int)
                 pg_ = np.full(best.shape, -1, dtype=int)
                 act = np.where(np.isfinite(best).any(axis=1))[0]
-                for l in range(lmin, lmax + 1):
+                l_lo, l_hi = (rng[k] if rng is not None else (lmin, int(math.floor(
+                    C.len_normal_max / step + 1e-9))))
+                for l in range(max(l_lo, 1), l_hi + 1):
                     a_ = act[act + l <= N]
                     if a_.size == 0:
                         break
@@ -621,8 +673,8 @@ class Optimizer:
                     tot[:, BIG] = INF
                     tot[:, caps < l * step - 1e-6] = INF
                     nxt = b_ - (lap_idx[b_] if jt == 'slip' else 0)
-                    if jt == 'slip' and C.keepout:
-                        tot[~ko_ok[b_], :] = INF
+                    if C.keepout:
+                        tot[~(ko_ok if jt == 'slip' else ko_ok_f)[b_], :] = INF
                     old = new[nxt].copy()
                     np.minimum.at(new, nxt, tot)       # nxt can repeat
                     win = (tot < old) & (tot == new[nxt])
@@ -634,7 +686,10 @@ class Optimizer:
                 best = new
                 ptrs.append((pa_, pl_, pg_))
             Lb = H - s
-            okb = (Lb >= C.min_tube - 1e-9) & (Lb <= C.len_normal_max + 1e-9)
+            # with a fixed shaft count the bottom may use the long-tube max
+            lb_max = (C.len_special_max if (C.n_segments_fixed is not None or rng is not None)
+                      else C.len_normal_max)
+            okb = (Lb >= C.min_tube - 1e-9) & (Lb <= lb_max + 1e-9)
             val, src = place(best, SM)
             tot = val + (CW[N] - CW)[:, None] * Gw[None, :]
             tot[:, BIG] = INF
@@ -812,7 +867,8 @@ class Optimizer:
                                cases=None if full else self.screen_cases,
                                bend_radius_factor=C.bend_radius_factor,
                                shear_mode=C.shear_mode, lap_stiffness=C.lap_stiffness,
-                               spacing=1.0 if full else 2.0, ds=0.25 if full else 0.5,
+                               spacing=1.0 if (full or self.fine_screen) else 2.0,
+                               ds=0.25 if (full or self.fine_screen) else 0.5,
                                keep_rows=full)
         w = pole_weight(spec, n_steps=40)['total_weight']
         dmax = r.max_defl_usage
@@ -958,7 +1014,11 @@ class Optimizer:
             # a fewer-segment design up to X% heavier can still win, so the
             # margin is at least X
             margin = 1 + max(self.C.fab_penalty_pct, NOISE_PCT, self.C.explore_margin_pct) / 100.0
-            if lb > min(best * margin, self._kth_weight(K)):
+            # Prune only against the best weight + margin. (A K-th-best cut
+            # was removed: screened weights can be optimistic -- designs that
+            # later fail the full check -- and on 004 R1 that cut skipped the
+            # real winner, 74,223 lb, as "worse than 11 lighter designs".)
+            if lb > best * margin:
                 self.lb_remaining = min(self.lb_remaining, lb)
                 break
             self.phase = label
@@ -1055,32 +1115,46 @@ class Optimizer:
         combos = self._combos(tips, bases, lay_c)
         self._search(combos, "Coarse search", 0.05, 0.55)
 
-        # refine around the best designs on the fine grid
-        best = sorted(self.found.values(), key=lambda x: x.weight)[:C.refine_top]
-        fine = []
+        # refine around the best designs on the fine grid; repeat (up to
+        # refine_rounds) while the best weight keeps improving, so a narrow
+        # feasible window (clearances, same-shaft spans, fixed shaft count)
+        # is walked to its local optimum instead of stopping after one step
         seen = set()
-        for e in best:
-            d = e.design
-            ntips = [t for t in (d.tip - C.tip_inc, d.tip, d.tip + C.tip_inc)
-                     if C.tip_min - 1e-9 <= t <= C.tip_max + 1e-9]
-            nbases = [b for b in (d.base - C.base_inc, d.base, d.base + C.base_inc)
-                      if C.base_min - 1e-9 <= b <= C.base_max + 1e-9]
-            nlay = {d.uppers}
-            for k in range(len(d.uppers)):
-                if C.custom_uppers is not None:
-                    break                          # custom layout: lengths are fixed
-                if d.uppers[k] is None:
-                    continue
-                for dl in (-1.0, -0.5, -0.25, 0.25, 0.5, 1.0):
-                    L = round(d.uppers[k] + dl, 2)
-                    if C.min_tube - 1e-9 <= L <= C.len_special_max + 1e-9:
-                        u = list(d.uppers); u[k] = L; nlay.add(tuple(u))
-            for c in self._combos(ntips, nbases, sorted(nlay, key=lambda u: tuple(-1 if x is None else x for x in u))):
-                key = (c[1].tip, c[1].base, c[1].uppers)
-                if key not in seen:
-                    seen.add(key); fine.append(c)
-        fine.sort(key=lambda x: x[0])
-        self._search(fine, "Refinement", 0.55, 0.8)
+        prev_best = float('inf')
+        for rnd in range(max(1, C.refine_rounds)):
+            best = sorted(self.found.values(), key=lambda x: x.weight)[:C.refine_top]
+            if not best or best[0].weight >= prev_best - 1e-6:
+                break
+            prev_best = best[0].weight
+            fine = []
+            for e in best:
+                d = e.design
+                ntips = [t for t in (d.tip - C.tip_inc, d.tip, d.tip + C.tip_inc)
+                         if C.tip_min - 1e-9 <= t <= C.tip_max + 1e-9]
+                nbases = [b for b in (d.base - C.base_inc, d.base, d.base + C.base_inc)
+                          if C.base_min - 1e-9 <= b <= C.base_max + 1e-9]
+                nlay = {d.uppers}
+                for k in range(len(d.uppers)):
+                    if C.custom_uppers is not None:
+                        break                          # custom layout: lengths are fixed
+                    if d.uppers[k] is None:
+                        continue
+                    for dl in (-2.0, -1.5, -1.0, -0.5, -0.25, 0.25, 0.5, 1.0, 1.5, 2.0):
+                        L = round(d.uppers[k] + dl, 2)
+                        if C.min_tube - 1e-9 <= L <= C.len_special_max + 1e-9:
+                            u = list(d.uppers); u[k] = L; nlay.add(tuple(u))
+                            # move this joint only: the tube below takes the change
+                            if k + 1 < len(d.uppers) and d.uppers[k + 1] is not None:
+                                L2 = round(d.uppers[k + 1] - dl, 2)
+                                if C.min_tube - 1e-9 <= L2 <= C.len_special_max + 1e-9:
+                                    u2 = list(u); u2[k + 1] = L2; nlay.add(tuple(u2))
+                for c in self._combos(ntips, nbases, sorted(nlay, key=lambda u: tuple(-1 if x is None else x for x in u))):
+                    key = (c[1].tip, c[1].base, c[1].uppers)
+                    if key not in seen:
+                        seen.add(key); fine.append(c)
+            fine.sort(key=lambda x: x[0])
+            self._search(fine, "Refinement" + (f" {rnd + 1}" if rnd else ""), 0.55 + 0.06 * rnd,
+                         0.61 + 0.06 * rnd)
 
         # verify on all load cases, full mesh
         uniq = {}
@@ -1116,6 +1190,79 @@ class Optimizer:
             if v is not None:
                 k = (v.design.tip, v.design.base, v.design.uppers, v.design.ts)
                 verified[k] = v
+        # Keep verifying, lightest screened design first, while one could
+        # still beat the best verified design (the full check only makes a
+        # design heavier). Screening is learned on the way: when a screened
+        # design fails the full check, the load cases it fails are added to
+        # the screening set, and every remaining candidate is re-screened with
+        # the new set before it is verified (lazily, lightest first). Before
+        # this, 004 R1 reported 74,907 lb: hundreds of designs screened at
+        # ~73,600 lb failed the full check, the verification cap was used up
+        # on them, and the real winner (74,223 lb) was never verified.
+        self.verify_extra, self.screen_added = 0, []
+        if verified:
+            import heapq
+            done = {(e.design.tip, e.design.base, e.design.uppers, e.design.ts) for e in pool}
+            margin = 1 + max(C.fab_penalty_pct, NOISE_PCT) / 100.0
+            ver = 0                                     # screening-set version
+            heap, cnt = [], 0
+            for e in self.found.values():
+                k0 = (e.design.tip, e.design.base, e.design.uppers, e.design.ts)
+                if k0 not in done:
+                    heapq.heappush(heap, (e.weight, cnt, ver, e)); cnt += 1
+            rescreens = 0
+            while heap and self.verify_extra < C.verify_extra_max and rescreens < 4 * C.verify_extra_max:
+                w0, _, v0, e = heapq.heappop(heap)
+                vbest = min(v.weight for v in verified.values())
+                if w0 > vbest * margin:
+                    break
+                if v0 != ver:                           # screened with an older set
+                    rescreens += 1
+                    e2 = self.size(Design(e.design.tip, e.design.base, e.design.uppers, e.design.ts),
+                                   budget=False)
+                    if e2 is not None:
+                        heapq.heappush(heap, (e2.weight, cnt, ver, e2)); cnt += 1
+                    continue
+                k0 = (e.design.tip, e.design.base, e.design.uppers, e.design.ts)
+                if k0 in done:
+                    continue
+                done.add(k0)
+                self.verify_extra += 1
+                self.progress(0.98, f"Verifying more candidates that could still win: "
+                                    f"{self.verify_extra} (screening cases added: {len(self.screen_added)})")
+                v = self.size(e.design, full=True, budget=False)
+                if v is not None:
+                    verified[(v.design.tip, v.design.base, v.design.uppers, v.design.ts)] = v
+                if v is None or v.weight > e.weight + 1.0:
+                    # the screen passed a design the full check does not: learn
+                    r = evaluate_candidate(e.spec, self.base, cases=None,
+                                           bend_radius_factor=C.bend_radius_factor,
+                                           shear_mode=C.shear_mode, lap_stiffness=C.lap_stiffness)
+                    have = {str(c) for c in self.screen_cases}
+                    new_cases = []
+                    for nm, cr in (r.cases or {}).items():
+                        su = cr.max_strength or 0.0
+                        du = ((cr.defl_check or {}).get('usage') or 0.0)
+                        if nm and str(nm) not in have and (su > C.strength_limit() + 1e-9
+                                                           or du > C.defl_limit() + 1e-9):
+                            new_cases.append(nm)
+                    if not new_cases:
+                        for nm in (r.gov_strength_case, r.gov_defl_case):
+                            if nm and str(nm) not in have:
+                                new_cases.append(nm)
+                    if new_cases:
+                        self.screen_cases = list(self.screen_cases) + new_cases
+                        self.screen_added += [str(x) for x in new_cases]
+                    elif not self.fine_screen:
+                        # failed on a case the screen already has: the coarse
+                        # screening mesh was optimistic -> screen on the full mesh
+                        self.fine_screen = True
+                        self.screen_added.append("(fine screening mesh)")
+                    else:
+                        continue
+                    self.cache = {k: v_ for k, v_ in self.cache.items() if k[-1]}
+                    self._env_cache.clear()
+                    ver += 1
         self.progress(1.0, "Ranking")
         return self._rank(list(verified.values()))
 

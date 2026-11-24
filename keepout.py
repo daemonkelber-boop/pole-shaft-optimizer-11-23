@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Iterable, Optional
 
 TYPES = ["None", "Bracket", "Vang"]
+GROUP = "Group"     # same-shaft group: no joint may sit inside its span
 
 
 @dataclass
@@ -32,6 +33,11 @@ class Station:
     clr_above: float = 0.0      # ft, band top to slip joint above
     clr_below: float = 0.0      # ft, band bottom to slip joint below
     source: str = "XML"         # 'XML' or 'user'
+    #: same-shaft group: (top, bottom) ft from top of the span no joint may
+    #: enter -- from the top of the highest member's clear zone to the bottom
+    #: of the lowest one. Touching the span edge is allowed (the members'
+    #: clearances are already inside it).
+    span: Optional[tuple] = None
 
     @property
     def half(self) -> float:
@@ -39,11 +45,11 @@ class Station:
 
     @property
     def band_top(self) -> float:
-        return self.from_top - self.half
+        return self.span[0] if self.span else self.from_top - self.half
 
     @property
     def band_bot(self) -> float:
-        return self.from_top + self.half
+        return self.span[1] if self.span else self.from_top + self.half
 
     @property
     def zone_top(self) -> float:
@@ -90,6 +96,10 @@ def zone_conflict(top: float, bot: float, s: Station) -> Optional[str]:
     or None. Used by both the Pole View check and the optimizer."""
     if not s.checked:
         return None
+    if s.span:                                                          # same-shaft group
+        if bot <= s.band_top + 1e-9 or top >= s.band_bot - 1e-9:
+            return None
+        return "joint inside the same-shaft span"
     if bot < s.band_top - 1e-9:                                         # joint above band
         gap = s.band_top - bot
         if gap < s.clr_above - 1e-9:
@@ -110,15 +120,17 @@ def check(stations: Iterable[Station], slip_joints) -> list[Result]:
                  if j.bot_from_top < s.band_top - 1e-9]
         below = [(j.top_from_top - s.band_bot, j.no) for j in slip_joints
                  if j.top_from_top > s.band_bot + 1e-9]
+        eps = -1e-9 if s.span else 1e-9          # groups: touching the span edge is fine
         over = [j.no for j in slip_joints
-                if not (j.bot_from_top < s.band_top - 1e-9 or j.top_from_top > s.band_bot + 1e-9)]
+                if not (j.bot_from_top < s.band_top - eps or j.top_from_top > s.band_bot + eps)]
         ga, na = min(above) if above else (None, None)
         gb, nb = min(below) if below else (None, None)
         no = over[0] if over else None
         if not s.checked:
             ok, why = None, ""
         elif no is not None:
-            ok, why = False, f"inside slip joint {no}"
+            ok, why = False, (f"joint {no} inside the same-shaft span" if s.span
+                              else f"inside slip joint {no}")
         else:
             why = []
             if ga is not None and ga < s.clr_above - 1e-9:
@@ -140,3 +152,26 @@ def stations_from_df(df) -> list[Station]:
                            clr_below=float(r["Clear to joint below (ft)"]),
                            source=str(r["Source"])))
     return out
+
+
+def group_station(label: str, members: list) -> Optional[Station]:
+    """Same-shaft group from member Stations: span = top of the highest
+    clear zone to the bottom of the lowest. None if fewer than 2 members."""
+    if len(members) < 2:
+        return None
+    top = min(m.zone_top for m in members)
+    bot = max(m.zone_bot for m in members)
+    return Station(label=label, from_top=(top + bot) / 2, kind=GROUP, source="group", span=(top, bot))
+
+
+class _J:
+    def __init__(self, no, top, bot, kind):
+        self.no, self.top_from_top, self.bot_from_top, self.kind = no, top, bot, kind
+
+
+def all_joints(L) -> list:
+    """Slip joints (lap zones) and flange joints (zero length) of a
+    PoleLayout, top -> down. Flanges are numbered F1, F2 ..."""
+    out = [_J(j.no, j.top_from_top, j.bot_from_top, "slip") for j in L.slip_joints]
+    out += [_J(f"F{k}", f, f, "flange") for k, f in enumerate(L.flange_joints, 1)]
+    return sorted(out, key=lambda j: j.top_from_top)

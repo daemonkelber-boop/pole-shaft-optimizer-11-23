@@ -75,13 +75,14 @@ def scene_from(L, results, T: dict, token: str = "") -> dict:
                 info += f"<br><b>✗ {r.reason}</b>"
                 tag += f"  ✗ {r.reason}"
         st = dict(label=s.label, y=agl(s.from_top), r=_d_at(L, s.from_top) / 24.0, bad=bad,
-                  info=info, tag=tag, band=None, zone=None)
-        if s.kind != "None" and s.height_in > 0:
+                  info=info, tag=tag, band=None, zone=None, group=bool(getattr(s, "span", None)))
+        if s.kind not in ("None", "Group") and s.height_in > 0:
             st["band"] = [agl(s.band_top), agl(s.band_bot)]
         if r is not None and s.checked and s.zone_bot - s.zone_top > 0.01:
             zt, zb = max(s.zone_top, 0.0), min(s.zone_bot, L.total_length)
             st["zone"] = dict(y0=agl(zt), y1=agl(zb), d0=_d_at(L, zt), d1=_d_at(L, zb),
-                              info=(f"<b>{s.label} clear zone</b> (no slip joint)"
+                              info=(f"<b>{s.label}</b>: no joint in this span" if st["group"] else
+                                    f"<b>{s.label} clear zone</b> (no slip joint)"
                                     f"<br>{zt:.2f}–{zb:.2f} ft from top · {agl(zt):.2f}–{agl(zb):.2f} ft AGL"
                                     f"<br>band {s.height_in:.2f} in + {s.clr_above:.2f} ft above + "
                                     f"{s.clr_below:.2f} ft below"))

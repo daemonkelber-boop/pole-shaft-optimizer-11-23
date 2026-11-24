@@ -264,12 +264,13 @@ def _draw_pole_diagram(spec, base, SB, clamp_names=None, keepout=None, arms=None
         zc = '#D50000' if r.ok is False else '#1565C0'
         ax.add_patch(mpatches.Rectangle((-xz, y_zb), 2 * xz, y_zt - y_zb, facecolor=zc,
                      alpha=0.12, edgecolor=zc, lw=0.9, linestyle='--', hatch='///', zorder=1))
-        ax.text(-xz - 0.3, (y_zt + y_zb) / 2 - 1.6, f'{s.label} clear zone\n{zt:.2f}–{zb:.2f}',
-                fontsize=6.5, ha='right', va='top', color=zc)
+        _zl = (f'{s.label}\nno joint {zt:.2f}–{zb:.2f}' if getattr(s, 'span', None)
+               else f'{s.label} clear zone\n{zt:.2f}–{zb:.2f}')
+        ax.text(-xz - 0.3, (y_zt + y_zb) / 2 - 1.6, _zl, fontsize=6.5, ha='right', va='top', color=zc)
     for r in keepout:
         s = r.station
-        if not s.checked and s.source == 'XML':
-            continue
+        if (not s.checked and s.source == 'XML') or getattr(s, 'span', None):
+            continue                       # same-shaft span: drawn as a zone only
         y_pt = y(s.from_top)
         y_bt, y_bb = y(s.band_top), y(s.band_bot)
         xf = face_half(y_pt)
@@ -545,6 +546,20 @@ def _view3d(L, res, fkey):
 
 KO_COLS = ["Item", "from_top", "Bracket / vang", "Height (in)",
            "Clear to joint above (ft)", "Clear to joint below (ft)", "Source"]
+
+
+def ko_stations(L, path):
+    """Checked clearance rows of the Tab 8 table plus the same-shaft group
+    (keepout.GROUP span from the members' clear zones), for checks and the
+    optimizer. Group members are used with their own heights / clearances."""
+    from keepout import stations_from_df, group_station
+    sts = stations_from_df(ko_table(L, path))
+    out = [s_ for s_ in sts if s_.checked]
+    names = st.session_state.get(f"ko_grp_{os.path.basename(path)}") or []
+    g = group_station(" + ".join(names) + " same shaft", [s_ for s_ in sts if s_.label in names])
+    if g is not None:
+        out.append(g)
+    return out, sts
 
 
 def ko_table(L, path):
@@ -1202,7 +1217,7 @@ with tab6:
                 strength_target=100.0, defl_target=100.0, tolerance_pct=0.0,
                 fab_penalty_pct=2.0,
                 n_alternates=10, log_all=False, time_limit_min=15.0, max_evals=200000,
-                bp_on=True, ko_on=False, cs_on=False)
+                bp_on=True, ko_on=False, cs_on=False, fixn_on=False, fixn=4)
             for k, v in DEF.items():
                 st.session_state.setdefault(f"o_{k}", v)
             if st.button("↺ Reset all constraints to defaults"):
@@ -1367,9 +1382,8 @@ with tab6:
                                  "with its own reactions. Compare plate options in Tab 7.")
                 st.markdown("**Special: bracket / vang clearance to slip joints**")
                 from pole_layout import build_layout as _bl6
-                from keepout import stations_from_df as _sdf6
                 _L6 = _bl6(spec6, base6, p6)
-                _ko6 = [s_ for s_ in _sdf6(ko_table(_L6, tmp_path)) if s_.checked]
+                _ko6, _ = ko_stations(_L6, tmp_path)
                 st.checkbox("Enforce bracket / vang clearances in the search", key="o_ko_on",
                             help="Hard rule. Every candidate's slip joints (top of male to bottom of "
                                  "female) must clear each checked row of the table in Tab 8 · Pole "
@@ -1391,7 +1405,8 @@ with tab6:
                 st.markdown("**Special: custom shaft layout**")
                 from custom_layout import default_from_spec as _cs_def
                 _cs6 = st.session_state.get(f"cs_{os.path.basename(tmp_path)}") or _cs_def(spec6)
-                st.checkbox("Optimize the custom shaft layout from Tab 8 (fixed count, lengths, joints)",
+                st.checkbox("Optimize the custom shaft layout from Tab 8 (fixed count and joints; "
+                            "exact lengths or flexible ranges)",
                             key="o_cs_on",
                             help="Only this layout is searched: the shaft count, the fabricated "
                                  "lengths of tubes 1..n-1 and each joint's slip/flange type are "
@@ -1399,9 +1414,25 @@ with tab6:
                                  "still chooses tip/base diameters, taper and wall thicknesses. "
                                  "Overrides the fixed-bottom option and the joint settings above. "
                                  "Edit it in Tab 8 · Pole View and click Update layout there.")
-                st.caption(f"Tab 8 layout: {_cs6['n']} shafts · " + (" / ".join(
-                    f"{L:g} ft ({j.lower()})" for L, j in zip(_cs6["lengths"], _cs6["joints"]))
-                    + " / bottom = rest" if _cs6["n"] > 1 else "single shaft"))
+                _flex6 = _cs6.get("mode") == "Flexible ranges"
+                if _flex6:
+                    _rng6 = [((L, L) if lk else (mn_, mx_)) for L, mn_, mx_, lk in
+                             zip(_cs6["lengths"], _cs6.get("mins", []), _cs6.get("maxs", []),
+                                 _cs6.get("locks", []))]
+                    st.caption(f"Tab 8 layout (flexible): {_cs6['n']} shafts · " + " / ".join(
+                        (f"{a_:g} ft locked" if a_ == b_ else f"{a_:g}–{b_:g} ft") + f" ({j.lower()})"
+                        for (a_, b_), j in zip(_rng6, _cs6["joints"])) + " / bottom = rest")
+                else:
+                    st.caption(f"Tab 8 layout (exact): {_cs6['n']} shafts · " + (" / ".join(
+                        f"{L:g} ft ({j.lower()})" for L, j in zip(_cs6["lengths"], _cs6["joints"]))
+                        + " / bottom = rest" if _cs6["n"] > 1 else "single shaft"))
+                st.markdown("**Shaft count**")
+                _fc = st.columns([1.4, 1])
+                _fc[0].checkbox("Fix the number of shafts", key="o_fixn_on",
+                                help="Search only this shaft count (the 2% extra-segment rule no "
+                                     "longer applies). Ignored when the custom layout is used, which "
+                                     "sets the count itself.")
+                _fc[1].number_input("Shafts", min_value=1, max_value=6, step=1, key="o_fixn")
                 st.checkbox("Log every candidate tried", key="o_log_all")
                 go_run = st.form_submit_button("▶ Run optimizer", type="primary")
 
@@ -1491,11 +1522,20 @@ with tab6:
                     coarse_len_values=_coarse6,
                     bp_rules=_bp_rules(p6, S) if S.o_bp_on else None,
                     keepout=(_ko6 if S.get("o_ko_on") else []))
+                if S.get("o_fixn_on"):
+                    C6.n_segments_fixed = int(S.o_fixn)
+                    C6.max_segments = max(C6.max_segments, int(S.o_fixn))
                 if S.get("o_cs_on"):
-                    # custom layout: fixed count / lengths / joints (joint k below tube k,
-                    # counted from the bottom as 1 = lowest joint for joint_overrides)
+                    # custom layout: fixed count / joints (joint k below tube k, counted
+                    # from the bottom as 1 = lowest joint for joint_overrides); exact
+                    # lengths, or per-tube ranges in flexible mode
                     _n6 = int(_cs6["n"])
-                    C6.custom_uppers = tuple(float(x) for x in _cs6["lengths"])
+                    C6.n_segments_fixed = _n6
+                    if _flex6:
+                        C6.custom_uppers = None
+                        C6.tube_len_ranges = tuple((float(a_), float(b_)) for a_, b_ in _rng6)
+                    else:
+                        C6.custom_uppers = tuple(float(x) for x in _cs6["lengths"])
                     C6.joint_overrides = {_n6 - 1 - k: ("flange" if j.lower().startswith("f") else "slip")
                                           for k, j in enumerate(_cs6["joints"])}
                     C6.max_segments = max(C6.max_segments, _n6)
@@ -1619,7 +1659,8 @@ with tab6:
                         from pole_layout import build_layout as _blw
                         from keepout import check as _kchk
                         _Lw = _blw(win.spec)
-                        _rw = _kchk(C6.keepout, _Lw.slip_joints)
+                        from keepout import all_joints as _aj
+                        _rw = _kchk(C6.keepout, _aj(_Lw))
                         _nb = sum(r_.ok is False for r_ in _rw)
                         (st.success if _nb == 0 else st.error)(
                             f"Bracket / vang clearances enforced ({len(C6.keepout)} rows): "
@@ -1637,6 +1678,56 @@ with tab6:
                             st.caption("Slip joints of this design (from top): " + ", ".join(
                                 f"#{j_.no} {j_.top_from_top:.2f}–{j_.bot_from_top:.2f}"
                                 for j_ in _Lw.slip_joints))
+                    with st.expander("What limits this design (rules at or near their limit)"):
+                        from pole_layout import build_layout as _blb
+                        _Lb = _blb(win.spec)
+                        _lb_rows = []
+
+                        def _lim(rule, value, limit, margin, unit, near):
+                            _lb_rows.append({"Rule": rule, "Value": value, "Limit": limit,
+                                             "Margin": f"{margin:+.2f} {unit}",
+                                             "At limit": "●" if margin <= near else ""})
+                        _lim("Taper (in/ft)", f"{win.spec.taper:.4f}", f"≤ {C6.taper_max:g}",
+                             C6.taper_max - win.spec.taper, "in/ft", 0.005)
+                        _lim("Strength usage", f"{win.strength:.2f}%", f"≤ {C6.strength_target:g}%",
+                             C6.strength_target - win.strength, "%", 0.5)
+                        if win.defl is not None:
+                            _lim("Deflection usage", f"{win.defl:.2f}%", f"≤ {C6.defl_target:g}%",
+                                 C6.defl_target - win.defl, "%", 0.5)
+                        _lay_b = win.spec.layout()
+                        _rngs = list(getattr(C6, "tube_len_ranges", None) or [])
+                        for k_, tb_ in enumerate(_lay_b):
+                            last_ = k_ == len(_lay_b) - 1
+                            lo_, hi_ = ((_rngs[k_] if k_ < len(_rngs) else (C6.min_tube, C6.len_special_max))
+                                        if not last_ else (C6.min_tube, C6.len_special_max))
+                            m_ = min(tb_["length"] - lo_, hi_ - tb_["length"])
+                            _lim(f"Tube {tb_['tube_no']} length" + (" (bottom)" if last_ else ""),
+                                 f"{tb_['length']:.2f} ft", f"{lo_:g}–{hi_:g} ft", m_, "ft", 0.25)
+                        if getattr(C6, "keepout", None):
+                            from keepout import all_joints as _ajb, check as _kcb
+                            for r_ in _kcb(C6.keepout, _ajb(_Lb)):
+                                s_ = r_.station
+                                if s_.span:
+                                    ms = []
+                                    for j_ in _ajb(_Lb):
+                                        if j_.bot_from_top <= s_.span[0] + 1e-9:
+                                            ms.append(s_.span[0] - j_.bot_from_top)
+                                        elif j_.top_from_top >= s_.span[1] - 1e-9:
+                                            ms.append(j_.top_from_top - s_.span[1])
+                                    if ms:
+                                        _lim(s_.label, f"span {s_.span[0]:.2f}–{s_.span[1]:.2f} ft",
+                                             "no joint inside", min(ms), "ft", 0.25)
+                                    continue
+                                if r_.gap_above is not None and s_.clr_above > 0:
+                                    _lim(f"{s_.label}: joint above", f"{r_.gap_above:.2f} ft",
+                                         f"≥ {s_.clr_above:g} ft", r_.gap_above - s_.clr_above, "ft", 0.25)
+                                if r_.gap_below is not None and s_.clr_below > 0:
+                                    _lim(f"{s_.label}: joint below", f"{r_.gap_below:.2f} ft",
+                                         f"≥ {s_.clr_below:g} ft", r_.gap_below - s_.clr_below, "ft", 0.25)
+                        st.dataframe(pd.DataFrame(_lb_rows), hide_index=True, width="stretch")
+                        st.caption("● = at or within a small margin of its limit (taper 0.005 in/ft, "
+                                   "usage 0.5%, lengths and clearances 0.25 ft): these are the rules "
+                                   "stopping a lighter design.")
                     for f_, v_ in (("tip", sw["D tip (in)"]), ("base", sw["D base (in)"])):
                         lim = (C6.tip_min, C6.tip_max) if f_ == "tip" else (C6.base_min, C6.base_max)
                         if abs(v_ - lim[0]) < 1e-6 or abs(v_ - lim[1]) < 1e-6:
@@ -2176,16 +2267,34 @@ with tab8:
                 L_, J_ = list(cs["lengths"]), list(cs["joints"])
                 while len(L_) < n_new - 1:
                     L_.append(53.0); J_.append("Slip")
-                cs = dict(n=n_new, lengths=L_[:n_new - 1], joints=J_[:n_new - 1])
+                cs = dict(n=n_new, lengths=L_[:n_new - 1], joints=J_[:n_new - 1],
+                          mins=(list(cs.get("mins", [])) + [15.0] * 6)[:n_new - 1],
+                          maxs=(list(cs.get("maxs", [])) + [60.0] * 6)[:n_new - 1],
+                          locks=(list(cs.get("locks", [])) + [False] * 6)[:n_new - 1],
+                          mode=cs.get("mode", "Exact lengths"))
                 st.session_state[cs_key] = cs
                 st.session_state[csv_key] += 1
             show_cs = k1[1].checkbox("Show in views and clearance check", key=f"cs_show_{fkey}")
             if k1[2].button("Reset to XML layout", key=f"cs_reset_{fkey}"):
                 del st.session_state[cs_key]
                 st.rerun()
+            nm1 = cs["n"] - 1
+            cs.setdefault("mins", [15.0] * nm1); cs.setdefault("maxs", [60.0] * nm1)
+            cs.setdefault("locks", [False] * nm1); cs.setdefault("mode", "Exact lengths")
+            for k_, v_ in (("mins", 15.0), ("maxs", 60.0), ("locks", False)):
+                cs[k_] = (list(cs[k_]) + [v_] * nm1)[:nm1]
             with st.form(f"cs_form_{fkey}"):
-                df_cs = pd.DataFrame({"Tube": [f"Tube {k + 1}" for k in range(cs["n"] - 1)],
+                cs_mode = st.radio(
+                    "Optimizer uses", ["Exact lengths", "Flexible ranges"], horizontal=True,
+                    index=0 if cs["mode"] == "Exact lengths" else 1, key=f"cs_mode_{fkey}",
+                    help="Exact: the optimizer keeps these lengths. Flexible: it keeps the shaft count "
+                         "and joint types, and may move each tube's length within Min–Max (Lock keeps "
+                         "the length); the splice search, clearances and same-shaft rule decide.")
+                df_cs = pd.DataFrame({"Tube": [f"Tube {k + 1}" for k in range(nm1)],
                                       "Fabricated length (ft)": [float(x) for x in cs["lengths"]],
+                                      "Min (ft)": [float(x) for x in cs["mins"]],
+                                      "Max (ft)": [float(x) for x in cs["maxs"]],
+                                      "Lock": [bool(x) for x in cs["locks"]],
                                       "Joint below": list(cs["joints"])})
                 ed_cs = st.data_editor(
                     df_cs, hide_index=True, num_rows="fixed", width="stretch",
@@ -2195,12 +2304,22 @@ with tab8:
                         "Fabricated length (ft)": st.column_config.NumberColumn(
                             format="%.2f", min_value=1.0, max_value=200.0, step=0.25, required=True),
                         "Joint below": st.column_config.SelectboxColumn(options=JOINTS, required=True),
+                        "Min (ft)": st.column_config.NumberColumn(format="%.2f", min_value=1.0,
+                                                                  step=0.25, help="Flexible mode only"),
+                        "Max (ft)": st.column_config.NumberColumn(format="%.2f", min_value=1.0,
+                                                                  step=0.25, help="Flexible mode only"),
+                        "Lock": st.column_config.CheckboxColumn(help="Flexible mode: keep this length"),
                     })
-                st.caption(f"Tube {cs['n']} (bottom) takes the rest of the height.")
+                st.caption(f"Tube {cs['n']} (bottom) takes the rest of the height. Min / Max / Lock "
+                           "apply in Flexible mode; the length column is the preview and start point.")
                 if st.form_submit_button("Update layout", type="primary"):
                     cs = dict(n=cs["n"],
                               lengths=[round(float(x), 2) for x in ed_cs["Fabricated length (ft)"]],
-                              joints=[str(x) for x in ed_cs["Joint below"]])
+                              joints=[str(x) for x in ed_cs["Joint below"]],
+                              mins=[round(float(x), 2) for x in ed_cs["Min (ft)"].fillna(15.0)],
+                              maxs=[round(float(x), 2) for x in ed_cs["Max (ft)"].fillna(60.0)],
+                              locks=[bool(x) for x in ed_cs["Lock"].fillna(False)],
+                              mode=cs_mode)
                     st.session_state[cs_key] = cs
                     st.session_state[csv_key] += 1
                     st.rerun()
@@ -2285,6 +2404,15 @@ with tab8:
                             help="Bracket/vang bottom to the top of the slip joint below"),
                         "Source": st.column_config.TextColumn(disabled=True),
                     })
+                grp_key = f"ko_grp_{fkey}"
+                grp_new = st.multiselect(
+                    "Keep on one shaft (no slip or flange joint between these)",
+                    options=[str(x) for x in canon["Item"]],
+                    default=[x for x in (st.session_state.get(grp_key) or [])
+                             if x in set(str(y) for y in canon["Item"])],
+                    help="E.g. C2 + C3. No joint may sit between the top of the highest member's "
+                         "clear zone and the bottom of the lowest member's clear zone (each member "
+                         "uses its own height and clearances from the table).")
                 b1 = st.columns([1, 1, 3])
                 do_update = b1[0].form_submit_button("Update check & views", type="primary")
                 do_fill = b1[1].form_submit_button("Fill all rows + update")
@@ -2310,11 +2438,16 @@ with tab8:
                     nc["Clear to joint above (ft)"] = float(fa)
                     nc["Clear to joint below (ft)"] = float(fb)
                 st.session_state[f"ko_{fkey}"] = nc
+                st.session_state[grp_key] = list(grp_new)
                 st.session_state[f"ko_ref_used_{fkey}"] = ref_new
                 st.session_state[ver_key] += 1
                 st.rerun()
 
-            res8 = check(stations_from_df(canon), L8.slip_joints)
+            from keepout import all_joints, GROUP
+            _ko8, _all8 = ko_stations(L8, tmp_path)
+            _J8 = all_joints(L8)
+            # every table row (checked or not) + the same-shaft group
+            res8 = check(_all8 + [x for x in _ko8 if x.kind == GROUP], _J8)
             n_chk = sum(r_.ok is not None for r_ in res8)
             n_bad = sum(r_.ok is False for r_ in res8)
             if n_chk == 0:
@@ -2324,19 +2457,22 @@ with tab8:
             else:
                 st.success(f"✓ All {n_chk} checked elevations clear the slip joints.")
 
+            _jmap8 = {j_.no: j_ for j_ in _J8}
+
             def _jtxt(no):
-                if no is None:
+                if no is None or no not in _jmap8:
                     return "—"
-                j_ = L8.slip_joints[no - 1]
-                return f"#{no} ({j_.top_from_top:.2f}–{j_.bot_from_top:.2f})"
+                j_ = _jmap8[no]
+                return (f"#{no} ({j_.top_from_top:.2f}–{j_.bot_from_top:.2f})" if j_.kind == "slip"
+                        else f"flange {no} ({j_.top_from_top:.2f})")
             st.dataframe(pd.DataFrame([{
                 "Item": r_.station.label, "Type": r_.station.kind,
                 "From top (ft)": r_.station.from_top,
                 "Above GL (ft)": L8.agl_of(r_.station.from_top),
                 "Band from top (ft)": f"{r_.station.band_top:.2f}–{r_.station.band_bot:.2f}",
-                "Slip joint above": _jtxt(r_.above_no),
+                "Joint above": _jtxt(r_.above_no),
                 "Gap above (ft)": r_.gap_above, "Need above (ft)": r_.station.clr_above,
-                "Slip joint below": _jtxt(r_.below_no),
+                "Joint below": _jtxt(r_.below_no),
                 "Gap below (ft)": r_.gap_below, "Need below (ft)": r_.station.clr_below,
                 "Result": {True: "✓ OK", False: "✗ " + r_.reason, None: "not checked"}[r_.ok],
             } for r_ in res8]).round(2), width="stretch", hide_index=True)

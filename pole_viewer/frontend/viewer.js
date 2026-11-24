@@ -347,6 +347,11 @@ function build(sc) {
   }
   // elevation markers, bracket / vang bands, labels (+X face)
   for (const s of sc.stations) {
+    if (s.group) {                       // same-shaft span: zone only, label at its top
+      if (s.zone) label(s.label, new THREE.Vector3(-s.r * 1.45 - 0.8, s.zone.y0 - 0.6, 0),
+                        s.bad ? C.bad : C.zone, true, true);
+      continue;
+    }
     const col = s.bad ? C.bad : C.primary;
     const mk = new THREE.Mesh(new THREE.OctahedronGeometry(0.45), mat(col, { flatShading: false }));
     mk.position.set(s.r * 1.04 + 0.3, s.y, 0);
