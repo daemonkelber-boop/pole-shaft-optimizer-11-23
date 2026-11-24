@@ -211,8 +211,9 @@ def build_figure(L: PoleLayout, T: dict, height_px: int = 900, results=None,
     ar = dict(x=k * 2 * half / dz, y=k * 2 * half / dz, z=k)
     zf = (zlo + zmax) / 2 if focus_agl is None or zoom <= 1.0 else focus_agl
     cz = (zf - (zlo + zmax) / 2) / dz * ar['z']
-    dirs = {'iso': (0.42, -0.72, 0.1), 'front': (0.0, -0.85, 0.0), 'side': (0.85, 0.0, 0.0),
-            'top': (0.0, -0.05, 0.85)}
+    # plotly x = PLS +Y (transverse, clamps face), plotly y = -PLS X
+    dirs = {'iso': (0.42, -0.72, 0.1), 'transverse': (0.0, -0.85, 0.0),
+            'longitudinal': (-0.85, 0.0, 0.0), 'top': (0.0, -0.05, 0.85)}
     ex, ey, ez = dirs.get(view, dirs['iso'])
     axis = dict(showbackground=False, showgrid=False, zeroline=False, title='',
                 showticklabels=False, showspikes=False)

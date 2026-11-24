@@ -168,12 +168,18 @@ def _draw_pole_diagram(spec, base, SB, clamp_names=None, keepout=None, arms=None
     attach_pts = [ap for ap in attach_pts if ap.s_pole <= gl_rd + 0.01]
 
     # ---- figure geometry ---------------------------------------------------
+    # arms point to +Y (right), as in PLS-POLE's transverse view; the blue
+    # dimension chains sit beyond the longest arm
     max_arm = max((ap.extra_horz for ap in attach_pts), default=0.0)
+    for a in arms:
+        for pt in a.points:
+            rd_ = max(0.0, min(gl_rd - pt.agl, spec.total_length))
+            max_arm = max(max_arm, pt.h - spec.diameter_at(rd_) / 24.0)
     x_pole_half_base = spec.base_diameter / 24.0 * WX
-    arm_pad    = 5.0
+    arm_pad    = 3.0 if max_arm > 0 else 0.0
     right_pad  = 18.0
-    x_left  = -(x_pole_half_base + max_arm + arm_pad + 10.0)
-    x_right =   x_pole_half_base + right_pad
+    x_left  = -(x_pole_half_base + 16.0)
+    x_right =   x_pole_half_base + max_arm + arm_pad + right_pad
 
     y_top = agl + 2.5
     y_bot = -spec.embedment - 1.5
@@ -258,8 +264,8 @@ def _draw_pole_diagram(spec, base, SB, clamp_names=None, keepout=None, arms=None
         zc = '#D50000' if r.ok is False else '#1565C0'
         ax.add_patch(mpatches.Rectangle((-xz, y_zb), 2 * xz, y_zt - y_zb, facecolor=zc,
                      alpha=0.12, edgecolor=zc, lw=0.9, linestyle='--', hatch='///', zorder=1))
-        ax.text(xz + 0.3, (y_zt + y_zb) / 2, f'{s.label} clear zone\n{zt:.2f}–{zb:.2f}',
-                fontsize=6.5, ha='left', va='center', color=zc)
+        ax.text(-xz - 0.3, (y_zt + y_zb) / 2 - 1.6, f'{s.label} clear zone\n{zt:.2f}–{zb:.2f}',
+                fontsize=6.5, ha='right', va='top', color=zc)
     for r in keepout:
         s = r.station
         if not s.checked and s.source == 'XML':
@@ -290,7 +296,7 @@ def _draw_pole_diagram(spec, base, SB, clamp_names=None, keepout=None, arms=None
     # ========================================================================
     # 4. ARMS
     # ========================================================================
-    # arms from the XML geometry (brackets + davits), drawn to the left;
+    # arms from the XML geometry (brackets + davits), drawn to the right (+Y);
     # horizontal distances are true ft measured out from the drawn face
     for a in arms:
         if not a.points:
@@ -300,7 +306,7 @@ def _draw_pole_diagram(spec, base, SB, clamp_names=None, keepout=None, arms=None
             yi = pt.agl
             rd_ = gl_rd - yi
             face_true = spec.diameter_at(max(0.0, min(rd_, spec.total_length))) / 24.0
-            xs_.append(-(face_half(yi) + (pt.h - face_true)))
+            xs_.append(face_half(yi) + (pt.h - face_true))
             ys_.append(yi)
         ax.plot(xs_, ys_, color=C_POLE if a.is_bracket else C_ARM,
                 lw=3.0 if a.is_bracket else 1.8, solid_capstyle='butt', zorder=5)
@@ -325,22 +331,22 @@ def _draw_pole_diagram(spec, base, SB, clamp_names=None, keepout=None, arms=None
             ax.text(-xf - 0.6, yi, clamp_names.get(ap.label, ap.label.split(':', 1)[-1]),
                     fontsize=8, ha='right', va='center', color=C_CHAIN, fontweight='bold')
             continue
-        x_wire = -(xf + arm_len)   # arms extend left
+        x_wire = xf + arm_len      # arms extend right (+Y)
         # bracket on pole face
         bh = 0.35
-        ax.plot([-xf, -xf], [yi - bh, yi + bh], color=C_POLE, lw=2.5, zorder=5)
+        ax.plot([xf, xf], [yi - bh, yi + bh], color=C_POLE, lw=2.5, zorder=5)
         # arm line (tapered hint: 3 sub-lines)
         for dx in (0.0, 0.15, -0.15):
-            ax.plot([x_wire, -xf], [yi + dx * 0.5, yi + dx * 0.5],
+            ax.plot([xf, x_wire], [yi + dx * 0.5, yi + dx * 0.5],
                     color=C_ARM, lw=0.9, alpha=0.8, zorder=4)
         # wire attachment dot
         ax.plot(x_wire, yi, 'o', color=C_DOT, ms=5, zorder=6)
         # label: arm length (above arm midpoint)
-        ax.text((x_wire + (-xf)) / 2, yi + 0.6, f'{arm_len:.2f}',
+        ax.text((x_wire + xf) / 2, yi + 0.6, f'{arm_len:.2f}',
                 fontsize=7.5, ha='center', va='bottom', color=C_ARM)
-        # label: attachment name (left of dot)
-        ax.text(x_wire - 0.4, yi, ap.label, fontsize=8,
-                ha='right', va='center', color=C_CHAIN,
+        # label: attachment name (right of dot)
+        ax.text(x_wire + 0.4, yi, ap.label, fontsize=8,
+                ha='left', va='center', color=C_CHAIN,
                 fontweight='bold')
 
     # ========================================================================
@@ -390,7 +396,7 @@ def _draw_pole_diagram(spec, base, SB, clamp_names=None, keepout=None, arms=None
     # 6. RIGHT DIMENSION CHAIN  (blue: inner clear-spans + laps + overall)
     # ========================================================================
     # Column x positions
-    x_c1 = x_pole_half_base + 2.5   # inner clear-spans + laps
+    x_c1 = x_pole_half_base + max_arm + arm_pad + 2.5   # inner clear-spans + laps
     x_c2 = x_c1 + 5.5               # tube fabricated lengths
     x_c3 = x_c2 + 5.0               # overall
 
@@ -483,6 +489,20 @@ def _draw_pole_diagram(spec, base, SB, clamp_names=None, keepout=None, arms=None
     if any(r.station.checked for r in keepout):
         patches.append(mpatches.Patch(facecolor='#1565C0', alpha=0.25, hatch='///',
                                       label='clear zone (no slip joint)'))
+    # ---- axis triad (PLS-POLE convention): Z up, +Y transverse (right),
+    #      +X longitudinal toward the viewer
+    tax = fig.add_axes([0.015, 0.035, 0.075, 0.075 * fig.get_figwidth() / fig.get_figheight()])
+    tax.set_xlim(-0.35, 1.6); tax.set_ylim(-0.45, 1.25); tax.axis('off')
+    tax.add_patch(mpatches.Rectangle((-0.3, -0.4), 1.85, 1.6, fill=False, ec='#212121', lw=0.8))
+    tax.annotate('', xy=(0, 1.0), xytext=(0, 0), arrowprops=dict(arrowstyle='-|>', color='#212121', lw=1.0))
+    tax.annotate('', xy=(1.0, 0), xytext=(0, 0), arrowprops=dict(arrowstyle='-|>', color='#212121', lw=1.0))
+    tax.plot(0, 0, 'o', mfc='none', mec='#212121', ms=7, mew=0.9)
+    tax.plot(0, 0, '.', color='#212121', ms=3)
+    tax.text(0.08, 1.02, 'Z', fontsize=8, fontweight='bold', va='center')
+    tax.text(1.05, 0.0, 'Y', fontsize=8, fontweight='bold', va='center')
+    tax.text(1.05, -0.22, 'trans', fontsize=6, va='center', color='#455A64')
+    tax.text(0.12, -0.25, 'X long', fontsize=6, va='center', color='#455A64')
+
     ax.legend(handles=patches, loc='lower center', bbox_to_anchor=(0.5, -0.04),
               ncol=len(patches), fontsize=7, framealpha=0.4, edgecolor='none')
 
@@ -509,7 +529,7 @@ def _view3d(L, res, fkey):
     zoom = c[1].select_slider("Zoom", options=[1, 1.5, 2, 3, 4, 6, 8, 12], value=1,
                               key=f"v3_zoom_{fkey}",
                               format_func=lambda v: f"{v:g}×")
-    view = c[2].selectbox("View", ["Iso", "Front", "Side", "Top"], key=f"v3_view_{fkey}")
+    view = c[2].selectbox("View", ["Iso", "Transverse", "Longitudinal", "Top"], key=f"v3_view_{fkey}")
     focus = dict(opts)[lab]
     if focus is not None and zoom == 1:
         st.caption("Pick a zoom above 1× to close in on the focus point.")

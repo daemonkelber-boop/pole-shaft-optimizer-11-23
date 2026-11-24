@@ -1,6 +1,10 @@
 // Pole viewer -- three.js (r160, vendored), Streamlit custom component.
-// Coordinates: ft. Y = height above ground line (AGL). Arms with azimuth 0
-// point along +X; clamps / brackets without arms sit on the +X face.
+// Coordinates: ft. three.js axes map to PLS-POLE axes as
+//   three +X = PLS +Y (transverse, azimuth 0)
+//   three +Y = PLS +Z (up; height above ground line)
+//   three +Z = PLS +X (longitudinal, azimuth 90)
+// (a cyclic swap, so handedness is kept). Arms with azimuth 0 point along
+// PLS +Y; clamps / brackets without arms sit on the +Y face.
 import * as THREE from './three.module.min.js';
 import { OrbitControls } from './OrbitControls.js';
 import { CSS2DRenderer, CSS2DObject } from './CSS2DRenderer.js';
@@ -32,12 +36,14 @@ const view = document.getElementById('view');
 const tip = document.getElementById('tip');
 let renderer, labelR, scene, camera, controls, model;
 
+// camera directions (from target toward camera), three.js coords
 const VIEWS = {
-  iso:   new THREE.Vector3(0.62, 0.22, 1.0).normalize(),
-  front: new THREE.Vector3(0, 0, 1),
-  side:  new THREE.Vector3(1, 0, 0),
-  top:   new THREE.Vector3(0, 1, 0.0015).normalize(),
+  iso:   new THREE.Vector3(0.55, 0.30, 0.80).normalize(),   // like PLS-POLE's default 3D view
+  trans: new THREE.Vector3(0, 0, 1),        // look along -X(PLS): transverse (Y) across the screen
+  long:  new THREE.Vector3(-1, 0, 0),       // look along +Y(PLS): longitudinal (X) across the screen
+  top:   new THREE.Vector3(0.0015, 1, 0).normalize(),
 };
+let gScene, gCam;
 const DIST = 2000;
 
 function init(sc) {
@@ -57,6 +63,9 @@ function init(sc) {
   const key = new THREE.DirectionalLight(0xffffff, 1.6);
   key.position.set(1, 1.5, 2);
   camera.add(key);                       // light follows the view
+
+  renderer.autoClear = false;
+  buildGizmo();
 
   controls = new OrbitControls(camera, renderer.domElement);
   controls.enableDamping = true;
@@ -176,10 +185,58 @@ function loop(now) {
   }
   if (controls.update()) S.dirty = true;
   if (S.dirty) {
+    const w = wrap.clientWidth, h = wrap.clientHeight;
+    renderer.setViewport(0, 0, w, h);
+    renderer.setScissorTest(false);
+    renderer.clear();
     renderer.render(scene, camera);
     labelR.render(scene, camera);
+    // axis triad, bottom-left, follows the camera rotation
+    const g = 104;
+    gCam.position.copy(camera.position).sub(controls.target).normalize().multiplyScalar(5);
+    gCam.up.copy(camera.up);
+    gCam.lookAt(0, 0, 0);
+    renderer.clearDepth();
+    renderer.setScissorTest(true);
+    renderer.setScissor(8, 26, g, g);
+    renderer.setViewport(8, 26, g, g);
+    renderer.render(gScene, gCam);
+    renderer.setScissorTest(false);
+    renderer.setViewport(0, 0, w, h);
     S.dirty = false;
   }
+}
+
+// ---------------- axis triad (PLS-POLE convention) ----------------
+function textSprite(txt, color, scale) {
+  const c = document.createElement('canvas');
+  c.width = 128; c.height = 64;
+  const x = c.getContext('2d');
+  x.font = 'bold 40px Roboto, Arial, sans-serif';
+  x.fillStyle = color; x.textAlign = 'center'; x.textBaseline = 'middle';
+  x.fillText(txt, 64, 32);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: t, depthTest: false }));
+  sp.scale.set(scale * 2, scale, 1);
+  return sp;
+}
+function buildGizmo() {
+  gScene = new THREE.Scene();
+  gCam = new THREE.OrthographicCamera(-1.7, 1.7, 1.7, -1.7, 0.1, 20);
+  const ax = [
+    [new THREE.Vector3(0, 1, 0), 'Z', '#212121'],
+    [new THREE.Vector3(0, 0, 1), 'X', '#c62828'],      // PLS +X longitudinal
+    [new THREE.Vector3(1, 0, 0), 'Y', '#1565c0'],      // PLS +Y transverse
+  ];
+  for (const [d, n, col] of ax) {
+    gScene.add(new THREE.ArrowHelper(d, new THREE.Vector3(0, 0, 0), 1.05, col, 0.3, 0.16));
+    const sp = textSprite(n, col, 0.42);
+    sp.position.copy(d.clone().multiplyScalar(1.4));
+    gScene.add(sp);
+  }
+  const sub = textSprite('Long', '#c62828', 0.28); sub.position.set(0, -0.35, 1.45); gScene.add(sub);
+  const sub2 = textSprite('Trans', '#1565c0', 0.28); sub2.position.set(1.45, -0.35, 0); gScene.add(sub2);
 }
 
 // ---------------- picking ----------------
@@ -339,6 +396,28 @@ function build(sc) {
   gl.computeLineDistances();
   model.add(gl);
   label('GL', new THREE.Vector3(gs + 0.5, 0, -gs), C.muted, true);
+  // azimuth ring at GL (PLS-POLE: 0 = +Y transverse, 90 = +X longitudinal)
+  const rr = gs * 1.25, ring = [];
+  for (let i = 0; i <= 96; i++) {
+    const a = i / 96 * Math.PI * 2;
+    ring.push(new THREE.Vector3(rr * Math.cos(a), 0, rr * Math.sin(a)));
+  }
+  model.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(ring),
+    new THREE.LineBasicMaterial({ color: C.muted, transparent: true, opacity: 0.6 })));
+  for (let deg = 0; deg < 360; deg += 30) {
+    const a = deg * Math.PI / 180, l = deg % 90 === 0 ? 0.16 : 0.08;
+    const p0 = new THREE.Vector3(rr * Math.cos(a), 0, rr * Math.sin(a));
+    const p1 = p0.clone().multiplyScalar(1 + l);
+    model.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([p0, p1]),
+      new THREE.LineBasicMaterial({ color: C.muted })));
+    if (deg % 90 === 0) label(String(deg), p0.clone().multiplyScalar(1.32), C.muted, true);
+  }
+  const axL = (v, t, col) => {
+    model.add(new THREE.ArrowHelper(v, new THREE.Vector3(0, 0, 0), rr * 1.15, col, rr * 0.12, rr * 0.06));
+    label(t, v.clone().multiplyScalar(rr * 1.22), col, true);
+  };
+  axL(new THREE.Vector3(1, 0, 0), '+Y Trans', '#1565c0');
+  axL(new THREE.Vector3(0, 0, 1), '+X Long', '#c62828');
 
   // focus list
   const sel = document.getElementById('focus');
