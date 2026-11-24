@@ -1202,7 +1202,7 @@ with tab6:
                 strength_target=100.0, defl_target=100.0, tolerance_pct=0.0,
                 fab_penalty_pct=2.0,
                 n_alternates=10, log_all=False, time_limit_min=15.0, max_evals=200000,
-                bp_on=True, ko_on=False)
+                bp_on=True, ko_on=False, cs_on=False)
             for k, v in DEF.items():
                 st.session_state.setdefault(f"o_{k}", v)
             if st.button("↺ Reset all constraints to defaults"):
@@ -1388,6 +1388,20 @@ with tab6:
                     st.caption("No checked rows yet: set brackets/vangs or clearances in "
                                "Tab 8 · Pole View and click Update there. With no rows, enforcing "
                                "changes nothing.")
+                st.markdown("**Special: custom shaft layout**")
+                from custom_layout import default_from_spec as _cs_def
+                _cs6 = st.session_state.get(f"cs_{os.path.basename(tmp_path)}") or _cs_def(spec6)
+                st.checkbox("Optimize the custom shaft layout from Tab 8 (fixed count, lengths, joints)",
+                            key="o_cs_on",
+                            help="Only this layout is searched: the shaft count, the fabricated "
+                                 "lengths of tubes 1..n-1 and each joint's slip/flange type are "
+                                 "fixed; the bottom tube takes the rest of the height. The optimizer "
+                                 "still chooses tip/base diameters, taper and wall thicknesses. "
+                                 "Overrides the fixed-bottom option and the joint settings above. "
+                                 "Edit it in Tab 8 · Pole View and click Update layout there.")
+                st.caption(f"Tab 8 layout: {_cs6['n']} shafts · " + (" / ".join(
+                    f"{L:g} ft ({j.lower()})" for L, j in zip(_cs6["lengths"], _cs6["joints"]))
+                    + " / bottom = rest" if _cs6["n"] > 1 else "single shaft"))
                 st.checkbox("Log every candidate tried", key="o_log_all")
                 go_run = st.form_submit_button("▶ Run optimizer", type="primary")
 
@@ -1477,6 +1491,15 @@ with tab6:
                     coarse_len_values=_coarse6,
                     bp_rules=_bp_rules(p6, S) if S.o_bp_on else None,
                     keepout=(_ko6 if S.get("o_ko_on") else []))
+                if S.get("o_cs_on"):
+                    # custom layout: fixed count / lengths / joints (joint k below tube k,
+                    # counted from the bottom as 1 = lowest joint for joint_overrides)
+                    _n6 = int(_cs6["n"])
+                    C6.custom_uppers = tuple(float(x) for x in _cs6["lengths"])
+                    C6.joint_overrides = {_n6 - 1 - k: ("flange" if j.lower().startswith("f") else "slip")
+                                          for k, j in enumerate(_cs6["joints"])}
+                    C6.max_segments = max(C6.max_segments, _n6)
+                    C6.fix_bottom = False
 
                 run_hdr = st.empty()
                 run_hdr.subheader("Running")
@@ -2126,7 +2149,84 @@ with tab8:
             p8    = load_parsed(tmp_path)
             spec8 = build_spec(p8)
             base8 = load_baseline(tmp_path)
-            L8    = build_layout(spec8, base8, p8)
+            fkey  = os.path.basename(tmp_path)
+
+            # ---- custom shaft layout (count, fabricated lengths, joints) -----
+            from custom_layout import JOINTS, default_from_spec, preview_spec
+            from weight import pole_weight
+            st.subheader("Custom shaft layout")
+            st.caption(
+                "Set the number of shafts, the **fabricated length** of each tube (lap included; "
+                "embedment included for the bottom tube) and **slip or flange** for each joint. The "
+                "bottom tube takes the rest of the pole height, with laps recomputed "
+                "(1.1 × 1.5 × female ID, rounded up). Starts as a copy of the XML layout. Tick "
+                "**Show in views** to draw it and run the clearance check on it (XML tip diameter, "
+                "taper and wall thicknesses — a preview). The Optimizer tab can optimize this exact "
+                "layout (Special: custom shaft layout).")
+            cs_key, csv_key = f"cs_{fkey}", f"cs_ver_{fkey}"
+            if cs_key not in st.session_state:
+                st.session_state[cs_key] = default_from_spec(spec8)
+                st.session_state[csv_key] = 0
+                st.session_state[f"cs_n_{fkey}"] = st.session_state[cs_key]["n"]
+            cs = st.session_state[cs_key]
+            k1 = st.columns([1, 1.7, 1])
+            n_new = int(k1[0].number_input("Number of shafts", min_value=1, max_value=6, step=1,
+                                           key=f"cs_n_{fkey}"))
+            if n_new != cs["n"]:
+                L_, J_ = list(cs["lengths"]), list(cs["joints"])
+                while len(L_) < n_new - 1:
+                    L_.append(53.0); J_.append("Slip")
+                cs = dict(n=n_new, lengths=L_[:n_new - 1], joints=J_[:n_new - 1])
+                st.session_state[cs_key] = cs
+                st.session_state[csv_key] += 1
+            show_cs = k1[1].checkbox("Show in views and clearance check", key=f"cs_show_{fkey}")
+            if k1[2].button("Reset to XML layout", key=f"cs_reset_{fkey}"):
+                del st.session_state[cs_key]
+                st.rerun()
+            with st.form(f"cs_form_{fkey}"):
+                df_cs = pd.DataFrame({"Tube": [f"Tube {k + 1}" for k in range(cs["n"] - 1)],
+                                      "Fabricated length (ft)": [float(x) for x in cs["lengths"]],
+                                      "Joint below": list(cs["joints"])})
+                ed_cs = st.data_editor(
+                    df_cs, hide_index=True, num_rows="fixed", width="stretch",
+                    key=f"cs_ed_{fkey}_{st.session_state[csv_key]}",
+                    column_config={
+                        "Tube": st.column_config.TextColumn(disabled=True),
+                        "Fabricated length (ft)": st.column_config.NumberColumn(
+                            format="%.2f", min_value=1.0, max_value=200.0, step=0.25, required=True),
+                        "Joint below": st.column_config.SelectboxColumn(options=JOINTS, required=True),
+                    })
+                st.caption(f"Tube {cs['n']} (bottom) takes the rest of the height.")
+                if st.form_submit_button("Update layout", type="primary"):
+                    cs = dict(n=cs["n"],
+                              lengths=[round(float(x), 2) for x in ed_cs["Fabricated length (ft)"]],
+                              joints=[str(x) for x in ed_cs["Joint below"]])
+                    st.session_state[cs_key] = cs
+                    st.session_state[csv_key] += 1
+                    st.rerun()
+            sp_cs, bot_cs, warn_cs = preview_spec(spec8, cs["lengths"], cs["joints"])
+            lay_cs = sp_cs.layout()
+            w_xml = pole_weight(spec8)["total_weight"]
+            w_cs = pole_weight(sp_cs)["total_weight"]
+            st.dataframe(pd.DataFrame([{
+                "Tube": tb["tube_no"], "Fabricated length (ft)": tb["length"],
+                "Joint below": ("base" if i == len(lay_cs) - 1 else tb["joint_type"]),
+                "Lap (ft)": tb["lap"] if tb["lap"] > 0 else float("nan"),
+                "t (in, from XML)": tb["thickness"],
+                "D top (in)": tb["d_top"], "D bot (in)": tb["d_bot"]}
+                for i, tb in enumerate(lay_cs)]), hide_index=True, width="stretch",
+                column_config={c_: st.column_config.NumberColumn(format="%.2f") for c_ in
+                               ("Fabricated length (ft)", "Lap (ft)", "D top (in)", "D bot (in)")}
+                | {"t (in, from XML)": st.column_config.NumberColumn(format="%.4f")})
+            st.caption(f"Bottom tube {bot_cs:.2f} ft · total {sp_cs.total_length:.2f} ft · preview "
+                       f"weight {w_cs:,.0f} lb (XML {w_xml:,.0f} lb; thicknesses borrowed from the XML, "
+                       "the optimizer sizes them).")
+            for w_ in warn_cs:
+                st.warning(w_)
+            spec_v = sp_cs if show_cs else spec8
+            if show_cs:
+                st.info("Views and clearance check below show the **custom layout**.")
+            L8    = build_layout(spec_v, base8, p8)
 
             m = st.columns(5)
             m[0].metric("Height", f"{L8.total_length:.2f} ft")
@@ -2146,7 +2246,6 @@ with tab8:
                 "joint below** (ft). Slip joint = top of male to bottom of female. A row is checked "
                 "when it has a bracket/vang or a clearance > 0; defaults are 0 (nothing assumed). "
                 "**Edits apply when you click Update.** The Optimizer tab can enforce these rows.")
-            fkey = os.path.basename(tmp_path)
             ver_key = f"ko_ver_{fkey}"
             canon = ko_table(L8, tmp_path)
             ref_used = st.session_state.get(f"ko_ref_used_{fkey}", "From pole top")
@@ -2260,7 +2359,7 @@ with tab8:
                            "zone; see-through sleeves = clear zones (blue clear, red clash).")
             with vt_2d:
                 names8 = {a.joint: a.label for a in L8.attachments}
-                fig8 = _draw_pole_diagram(spec8, base8, SB, clamp_names=names8, keepout=res8,
+                fig8 = _draw_pole_diagram(spec_v, base8, SB, clamp_names=names8, keepout=res8,
                                           arms=L8.arms)
                 svg_viewer(fig_to_svg(fig8), SB, height=820, token=fkey, key=f"sv_{fkey}")
                 plt.close(fig8)

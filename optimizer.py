@@ -159,6 +159,12 @@ class OptConstraints:
     #: Empty = off. Hard rule: a candidate whose slip joint zone breaks any
     #: station is rejected, and the splice-height search skips those splices.
     keepout: List = field(default_factory=list)
+    #: custom shaft layout (Pole View tab): fabricated lengths of tubes
+    #: 1..n-1, top -> down; the bottom tube takes the remaining height.
+    #: None = off. When set, ONLY this layout is searched (no splice search,
+    #: no length enumeration, baseline layout not seeded); joint types come
+    #: from joint_overrides. Diameters, taper and thicknesses are optimized.
+    custom_uppers: Optional[Tuple[float, ...]] = None
 
     @property
     def long_tube_threshold_pct(self) -> float:
@@ -206,6 +212,10 @@ class OptConstraints:
 # --------------------------------------------------------------------------
 # Candidate construction
 # --------------------------------------------------------------------------
+
+class _SkipSeed(Exception):
+    """Internal: skip the baseline seed (custom shaft layout in use)."""
+
 
 @dataclass
 class Design:
@@ -448,6 +458,8 @@ class Optimizer:
         geometrically possible (the section-length rule), because they would
         be discarded at ranking anyway."""
         C, H = self.C, self.H
+        if C.custom_uppers is not None:
+            return [tuple(C.custom_uppers)]
         out = []
         for n in range(1, C.max_segments + 1):
             nj = sum(1 for k in range(1, n) if C.joint_type(k) == 'slip')
@@ -501,7 +513,7 @@ class Optimizer:
         normal sizing, screening and full verification decide every design.
         """
         C, G, H = self.C, self.G, self.H
-        if not C.splice_search or C.fix_bottom:
+        if not C.splice_search or C.fix_bottom or C.custom_uppers is not None:
             return []
         key = (tip, base)
         if key in self._splice_cache:
@@ -993,6 +1005,8 @@ class Optimizer:
         self.seed_note = ''
         bs = self.baseline_spec
         try:
+            if C.custom_uppers is not None:
+                raise _SkipSeed
             ups = tuple(sg.length for sg in bs.segments[:-1])
             idx = tuple(next(i for i, g in enumerate(self.G) if abs(g - sg.thickness) < 1e-6)
                         for sg in bs.segments)
@@ -1025,6 +1039,9 @@ class Optimizer:
                 self.seed_note = f"passes as-is (same thicknesses); {lay_note}"
         except StopIteration:
             self.seed_note = "baseline thickness not in the thickness list -- not seeded"
+        except _SkipSeed:
+            self.seed_note = ("custom shaft layout in use: only " + " / ".join(
+                f"{L:g}" for L in C.custom_uppers) + " ft (+ bottom) is searched; baseline not seeded")
 
         self.progress(0.02, "Building coarse candidate list")
         combos = self._combos(tips, bases, lay_c)
@@ -1042,6 +1059,8 @@ class Optimizer:
                       if C.base_min - 1e-9 <= b <= C.base_max + 1e-9]
             nlay = {d.uppers}
             for k in range(len(d.uppers)):
+                if C.custom_uppers is not None:
+                    break                          # custom layout: lengths are fixed
                 if d.uppers[k] is None:
                     continue
                 for dl in (-1.0, -0.5, -0.25, 0.25, 0.5, 1.0):
