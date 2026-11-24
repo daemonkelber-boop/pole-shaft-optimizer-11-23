@@ -137,3 +137,32 @@ def scene_from(L, results, T: dict, token: str = "") -> dict:
 
 def pole_viewer(scene: dict, height: int = 820, key: str | None = None):
     return _component(scene=scene, height=height, key=key, default=None)
+
+
+# ---------------------------------------------------------------------------
+# 2D drawing viewer: the matplotlib elevation as vector SVG with smooth
+# pan / zoom in the browser (no reruns while navigating).
+# ---------------------------------------------------------------------------
+_SVG_FRONTEND = os.path.join(os.path.dirname(os.path.abspath(__file__)), "svg_frontend")
+_svg_component = components.declare_component("pole_svg_viewer", path=_SVG_FRONTEND)
+
+
+def fig_to_svg(fig) -> str:
+    """Matplotlib figure -> SVG text (text kept as text: small, sharp, searchable)."""
+    import io
+    import matplotlib as mpl
+    buf = io.StringIO()
+    with mpl.rc_context({"svg.fonttype": "none"}):
+        fig.savefig(buf, format="svg", bbox_inches="tight", facecolor=fig.get_facecolor())
+    s = buf.getvalue()
+    i = s.find("<svg")
+    return s[i:] if i >= 0 else s
+
+
+def svg_viewer(svg: str, T: dict, height: int = 820, token: str = "", key: str | None = None):
+    import hashlib
+    colors = dict(bg=T.get("bg_surface", "#ffffff"), surface=T.get("bg_surface", "#ffffff"),
+                  border=T.get("border", "#cdd6da"), text=T.get("text", "#041e2b"),
+                  muted=T.get("text_muted", "#8399a3"), primary=T.get("primary", "#3d98d3"))
+    return _svg_component(svg=svg, svg_key=hashlib.md5(svg.encode()).hexdigest(), colors=colors,
+                          height=height, token=token, key=key, default=None)

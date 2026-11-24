@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; background: transparent;
+    font-family: Roboto, "Segoe UI", Arial, sans-serif; }
+  #wrap { position: relative; width: 100%; overflow: hidden; border-radius: 6px;
+    cursor: grab; touch-action: none; user-select: none; }
+  #wrap.drag { cursor: grabbing; }
+  #stage { position: absolute; left: 0; top: 0; transform-origin: 0 0; will-change: transform; }
+  #stage svg { display: block; }
+  #bar { position: absolute; top: 8px; left: 8px; z-index: 5; display: flex; flex-wrap: wrap;
+    gap: 6px; align-items: center; }
+  .btn { font: 500 12px Roboto, Arial, sans-serif; height: 28px; padding: 0 10px; border-radius: 4px;
+    border: 1px solid var(--border); background: var(--surface); color: var(--text); cursor: pointer; }
+  .btn:hover { border-color: var(--primary); }
+  .grp { display: flex; }
+  .grp .btn { border-radius: 0; margin-left: -1px; }
+  .grp .btn:first-child { border-radius: 4px 0 0 4px; margin-left: 0; }
+  .grp .btn:last-child { border-radius: 0 4px 4px 0; }
+  .spd { font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 4px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 4px;
+    height: 26px; padding: 0 8px; }
+  .spd input { width: 70px; }
+  #pct { font-size: 11px; color: var(--muted); background: var(--surface); border: 1px solid var(--border);
+    border-radius: 4px; height: 26px; line-height: 26px; padding: 0 8px; min-width: 38px; text-align: center; }
+  #help { position: absolute; bottom: 6px; left: 8px; z-index: 5; font-size: 11px; color: var(--muted);
+    pointer-events: none; background: var(--surface); padding: 1px 4px; border-radius: 3px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="stage"></div>
+  <div id="bar">
+    <button class="btn" id="fit" title="Whole drawing">Fit</button>
+    <button class="btn" id="width" title="Fit the drawing width">Fit width</button>
+    <div class="grp">
+      <button class="btn" id="zin" title="Zoom in">+</button>
+      <button class="btn" id="zout" title="Zoom out">−</button>
+    </div>
+    <span id="pct">100%</span>
+    <label class="spd" title="Mouse-wheel zoom speed">wheel
+      <input type="range" id="speed" min="0.1" max="1.5" step="0.05" value="0.5"></label>
+  </div>
+  <div id="help">Wheel zoom (to cursor) · drag to pan · double-click to zoom in</div>
+</div>
+<script>
+// Smooth pan / zoom for a vector (SVG) drawing. Streamlit component, no libraries.
+(function () {
+  function send(type, data) {
+    window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data || {}), '*');
+  }
+  const wrap = document.getElementById('wrap'), stage = document.getElementById('stage');
+  const S = { x: 0, y: 0, s: 1, gx: 0, gy: 0, gs: 1, w: 1, h: 1, vx: 0, vy: 0,
+              drag: null, token: null, svgKey: null, run: false };
+
+  function clampS(s) { return Math.min(Math.max(s, S.fitS * 0.5), S.fitS * 40); }
+
+  function zoomAt(f, cx, cy) {                     // set goal so (cx,cy) stays put
+    S.touched = true;
+    const ns = clampS(S.gs * f), k = ns / S.gs;
+    S.gx = cx - (cx - S.gx) * k; S.gy = cy - (cy - S.gy) * k; S.gs = ns; kick();
+  }
+  function fit(mode) {
+    const W = wrap.clientWidth, H = wrap.clientHeight;
+    if (!W || !H) return;
+    S.fitS = Math.min(W / S.w, H / S.h);
+    const s = mode === 'width' ? W / S.w * 0.98 : S.fitS * 0.98;
+    S.gs = s; S.gx = (W - S.w * s) / 2; S.gy = mode === 'width' ? 8 : (H - S.h * s) / 2;
+    kick();
+  }
+  function apply() {
+    stage.style.transform = 'translate(' + S.x + 'px,' + S.y + 'px) scale(' + S.s + ')';
+    document.getElementById('pct').textContent = Math.round(S.s / S.fitS * 100) + '%';
+  }
+  function kick() { if (!S.run) { S.run = true; requestAnimationFrame(tick); } }
+  function tick() {
+    // inertia after a drag
+    if (!S.drag && (Math.abs(S.vx) > 0.05 || Math.abs(S.vy) > 0.05)) {
+      S.gx += S.vx; S.gy += S.vy; S.vx *= 0.9; S.vy *= 0.9;
+    }
+    const a = S.drag ? 1 : 0.2;
+    S.x += (S.gx - S.x) * a; S.y += (S.gy - S.y) * a; S.s += (S.gs - S.s) * a;
+    const done = Math.abs(S.gx - S.x) < 0.2 && Math.abs(S.gy - S.y) < 0.2 &&
+                 Math.abs(S.gs - S.s) < S.gs * 1e-4 && Math.abs(S.vx) <= 0.05 && Math.abs(S.vy) <= 0.05;
+    if (done) { S.x = S.gx; S.y = S.gy; S.s = S.gs; }
+    apply();
+    if (done && !S.drag) S.run = false; else requestAnimationFrame(tick);
+  }
+  function pt(e) { const r = wrap.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; }
+
+  wrap.addEventListener('wheel', function (e) {
+    e.preventDefault();
+    const k = parseFloat(document.getElementById('speed').value) || 0.5;
+    const d = Math.max(-1, Math.min(1, -e.deltaY / 120));
+    const p = pt(e);
+    zoomAt(Math.exp(d * 0.36 * k), p[0], p[1]);
+  }, { passive: false });
+  wrap.addEventListener('pointerdown', function (e) {
+    if (e.target.closest('#bar')) return;
+    wrap.setPointerCapture(e.pointerId);
+    S.drag = { x: e.clientX, y: e.clientY, t: performance.now() };
+    S.touched = true;
+    S.vx = S.vy = 0; wrap.classList.add('drag'); kick();
+  });
+  wrap.addEventListener('pointermove', function (e) {
+    if (!S.drag) return;
+    const dx = e.clientX - S.drag.x, dy = e.clientY - S.drag.y, now = performance.now();
+    const dt = Math.max(now - S.drag.t, 1);
+    S.gx += dx; S.gy += dy;
+    S.vx = dx * 16 / dt; S.vy = dy * 16 / dt;
+    S.drag = { x: e.clientX, y: e.clientY, t: now };
+  });
+  function end() { S.drag = null; wrap.classList.remove('drag'); kick(); }
+  wrap.addEventListener('pointerup', end);
+  wrap.addEventListener('pointercancel', end);
+  wrap.addEventListener('dblclick', function (e) {
+    if (e.target.closest('#bar')) return;
+    const p = pt(e); zoomAt(2, p[0], p[1]);
+  });
+  document.getElementById('fit').onclick = function () { S.touched = false; fit('all'); };
+  document.getElementById('width').onclick = function () { S.touched = true; fit('width'); };
+  document.getElementById('zin').onclick = function () {
+    zoomAt(1.5, wrap.clientWidth / 2, wrap.clientHeight / 2);
+  };
+  document.getElementById('zout').onclick = function () {
+    zoomAt(1 / 1.5, wrap.clientWidth / 2, wrap.clientHeight / 2);
+  };
+  function snapFit() { fit('all'); S.x = S.gx; S.y = S.gy; S.s = S.gs; apply(); }
+  new ResizeObserver(function () {
+    const W = wrap.clientWidth;
+    if (!W) return;
+    if (!S.touched) snapFit();                   // tab shown / resized: re-centre until the user moves it
+    else S.fitS = Math.min(W / S.w, wrap.clientHeight / S.h);
+  }).observe(wrap);
+
+  window.addEventListener('message', function (ev) {
+    const d = ev.data;
+    if (!d || d.type !== 'streamlit:render') return;
+    const a = d.args || {}, C = a.colors || {};
+    const r = document.documentElement.style;
+    r.setProperty('--surface', C.surface || '#fff'); r.setProperty('--border', C.border || '#ccc');
+    r.setProperty('--text', C.text || '#000'); r.setProperty('--muted', C.muted || '#888');
+    r.setProperty('--primary', C.primary || '#3d98d3');
+    wrap.style.background = C.bg || '#fff';
+    const H = a.height || 820;
+    wrap.style.height = H + 'px';
+    send('streamlit:setFrameHeight', { height: H });
+    if (a.svg_key !== S.svgKey) {                  // new drawing content
+      S.svgKey = a.svg_key;
+      stage.innerHTML = a.svg || '';
+      const svg = stage.querySelector('svg');
+      if (svg) {
+        const vb = svg.viewBox && svg.viewBox.baseVal;
+        S.w = (vb && vb.width) || parseFloat(svg.getAttribute('width')) || 800;
+        S.h = (vb && vb.height) || parseFloat(svg.getAttribute('height')) || 1000;
+        svg.setAttribute('width', S.w); svg.setAttribute('height', S.h);
+      }
+      const keep = a.token === S.token && S.fitS;   // same pole: keep the user's zoom / pan
+      S.token = a.token;
+      S.fitS = Math.min((wrap.clientWidth || 1) / S.w, H / S.h);
+      if (!keep) { S.touched = false; snapFit(); }
+      else kick();
+    }
+  });
+  send('streamlit:componentReady', { apiVersion: 1 });
+})();
+</script>
+</body>
+</html>

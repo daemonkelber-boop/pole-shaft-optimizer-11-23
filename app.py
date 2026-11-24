@@ -2222,36 +2222,31 @@ with tab8:
                 "Result": {True: "✓ OK", False: "✗ " + r_.reason, None: "not checked"}[r_.ok],
             } for r_ in res8]).round(2), width="stretch", hide_index=True)
 
-            c2d, c3d = st.columns([1, 1])
-            with c2d:
-                st.markdown("**Elevation with dimensions** (ft; width drawn 1.6× for clarity)")
+            # ---- one view panel: 3D (three.js / Plotly) and 2D, switched by tabs ----
+            from pole_viewer import pole_viewer, scene_from, svg_viewer, fig_to_svg
+            st.markdown("**Pole views**")
+            vt_smooth, vt_basic, vt_2d = st.tabs(["3D · smooth (three.js)", "3D · basic (Plotly)",
+                                                  "2D elevation"])
+            with vt_smooth:
+                pole_viewer(scene_from(L8, res8, SB, token=fkey), height=820, key=f"pv_{fkey}")
+                st.caption("Left-drag rotate · right-drag pan · wheel zoom to cursor · double-click "
+                           "a part to focus. Amber = slip joint (male top to female bottom). "
+                           "See-through sleeve = clear zone (blue clear, red clash). Blue diamonds = "
+                           "elevations on one face. Arms and brackets from the XML at their real "
+                           "length and taper. Hover any part for details.")
+            with vt_basic:
+                _view3d(L8, res8, fkey)
+                st.caption("Fallback view in case the smooth one does not load. Amber = slip joint "
+                           "zone; see-through sleeves = clear zones (blue clear, red clash).")
+            with vt_2d:
                 names8 = {a.joint: a.label for a in L8.attachments}
                 fig8 = _draw_pole_diagram(spec8, base8, SB, clamp_names=names8, keepout=res8,
                                           arms=L8.arms)
-                st.pyplot(fig8, width="stretch")
+                svg_viewer(fig_to_svg(fig8), SB, height=820, token=fkey, key=f"sv_{fkey}")
                 plt.close(fig8)
-            with c3d:
-                eng = st.radio("3D viewer", ["Smooth (three.js)", "Basic (Plotly)"], horizontal=True,
-                               key="v3_engine",
-                               help="Smooth: runs in your browser, glides with no lag. Basic: the "
-                                    "older Plotly view, in case the smooth one does not load.")
-                if eng.startswith("Smooth"):
-                    from pole_viewer import pole_viewer, scene_from
-                    st.markdown("**3D model** (true scale)")
-                    pole_viewer(scene_from(L8, res8, SB, token=fkey), height=820,
-                                key=f"pv_{fkey}")
-                    st.caption("Amber = slip joint (male top to female bottom). See-through sleeve = "
-                               "clear zone (blue clear, red clash). Blue diamonds = elevations on one "
-                               "face. Arms and brackets from the XML at their real length and taper. "
-                               "Hover any part for details.")
-                else:
-                    _view3d(L8, res8, fkey)
-                st.caption("Amber = slip joint zone (top of male to bottom of female). "
-                           "Blue diamonds = elevations, all drawn on one face (the XML gives "
-                           "clamp heights only, not their side). Dark plates = brackets/vangs. "
-                           "See-through sleeves = clear zones (bracket/vang band + clearance "
-                           "above and below, where no slip joint may sit): blue = clear, "
-                           "red = a slip joint is inside or too close.")
+                st.caption("Vector drawing (stays sharp at any zoom): wheel zoom to cursor · drag to "
+                           "pan · double-click to zoom in · Fit / Fit width. Dimensions in ft; pole "
+                           "width drawn 1.6× for clarity, arm lengths true.")
 
             with st.expander("All locations on the pole"):
                 st.dataframe(pd.DataFrame(location_rows(L8)).round(2), width="stretch",
